@@ -34,9 +34,10 @@ from pathlib import Path
 from typing import NoReturn
 
 try:  # bevorzugt der offizielle PEP-508-Parser
-    from packaging.requirements import Requirement
+    from packaging.requirements import InvalidRequirement, Requirement
 except ModuleNotFoundError:  # Fallback, damit das Skript auch nackt laeuft
     Requirement = None  # type: ignore[assignment]
+    InvalidRequirement = ValueError  # type: ignore[assignment,misc]
 
 _SPEC_RE = re.compile(r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?P<extras>\[[^\]]*\])?")
 _VERSION_LINE_RE = re.compile(r'(?m)^version\s*=\s*"[^"]*"')
@@ -72,7 +73,7 @@ def strip_version(spec: str, keep_extras: bool = True, keep_markers: bool = True
     if Requirement is not None:
         try:
             req = Requirement(spec)
-        except Exception:
+        except InvalidRequirement:
             req = None
         if req is not None:
             if req.url:
@@ -299,7 +300,8 @@ def main() -> int:
                                    version, readme if isinstance(readme, str) else None)
             pyproject.write_text(text, encoding="utf-8")
 
-    except Exception as e:  # Notbremse: alten Stand zurueckholen
+    except Exception as e:  # noqa: BLE001 -- Notbremse: bei JEDEM Fehler (uv,
+        # Dateisystem, ...) den alten Stand zurueckholen, daher bewusst breit
         say(f"\n{e}", C_ERR)
         if not args.dry_run:
             shutil.copy2(backup / "pyproject.toml", pyproject)
