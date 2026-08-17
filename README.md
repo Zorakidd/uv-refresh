@@ -1,74 +1,73 @@
 # uv-refresh
 
-Baut die `pyproject.toml` eines uv-Projekts neu auf, damit alle Dependencies
-frisch aufgelöst werden statt alte Versionsbindungen mitzuschleppen.
+Rebuilds a uv project's `pyproject.toml` so every dependency gets freshly
+resolved instead of dragging along old version pins.
 
-## Ablauf
+## How it works
 
-1. `pyproject.toml` lesen, Dependencies ohne Versionsangabe einsammeln
-   (Extras und Environment-Marker bleiben erhalten; `include-group`-Einträge
-   aus `dependency-groups` werden dabei aufgelöst, nicht verworfen)
-2. `pyproject.toml` und `uv.lock` nach `.uv-refresh-backup/<zeitstempel>/` sichern
-3. `uv init --bare` + `uv add <pakete>` in einem Temp-Verzeichnis neben dem
-   Projekt ausführen -- die echte `pyproject.toml` bleibt dabei unangetastet
-4. Nur `dependencies`/`optional-dependencies`/`dependency-groups` aus dem
-   Ergebnis in eine Kopie der ORIGINALEN `pyproject.toml` einmergen -- alles
-   andere bleibt unangetastet
-5. Ergebnis atomar an die Stelle der alten `pyproject.toml`/`uv.lock` setzen
+1. Read `pyproject.toml`, collect the dependencies without their version
+   specifiers (extras and environment markers are kept; `include-group`
+   entries in `dependency-groups` are resolved, not dropped)
+2. Back up `pyproject.toml` and `uv.lock` into `.uv-refresh-backup/<timestamp>/`
+3. Run `uv init --bare` + `uv add <packages>` in a temp directory next to
+   the project -- the real `pyproject.toml` stays untouched the whole time
+4. Merge only `dependencies`/`optional-dependencies`/`dependency-groups`
+   from the result into a copy of the ORIGINAL `pyproject.toml` -- everything
+   else stays untouched
+5. Atomically swap the result in place of the old `pyproject.toml`/`uv.lock`
 
-Schlägt ein Schritt fehl -- auch per Ctrl+C --, wurde die echte
-`pyproject.toml` nie verändert, weil der komplette Aufbau im
-Temp-Verzeichnis geschah. Das Backup liegt zusätzlich als Referenz bereit.
+If any step fails -- including Ctrl+C -- the real `pyproject.toml` was never
+touched, since the whole build happened in the temp directory. The backup
+is kept around as an extra reference regardless.
 
 ## Installation
 
     uv tool install uv-refresh
 
-Macht `uv-refresh` dauerhaft als Befehl verfügbar (global im PATH).
+Makes `uv-refresh` permanently available as a command (globally on PATH).
 
-Für einen einmaligen Testlauf, ganz ohne etwas zu installieren:
+For a one-off test run, without installing anything:
 
     uvx uv-refresh --dry-run
 
-Oder direkt aus dem Repo, z. B. um einen unveröffentlichten Stand zu testen:
+Or straight from the repo, e.g. to try an unreleased version:
 
     uv tool install git+https://github.com/Zorakidd/uv-refresh
 
-## Benutzung
+## Usage
 
-    uv-refresh --dry-run     # nur anzeigen, nichts verändern
-    uv-refresh               # mit Rückfrage durchziehen
-    uv-refresh -y            # ohne Rückfrage
+    uv-refresh --dry-run     # just show what would happen, change nothing
+    uv-refresh               # runs with a confirmation prompt
+    uv-refresh -y            # no confirmation prompt
 
-## Optionen
+## Options
 
-| Flag | Wirkung |
+| Flag | Effect |
 | --- | --- |
-| `--path PFAD` | anderes Projektverzeichnis (Default: aktuelles) |
-| `--dry-run` | zeigt nur, was passieren würde |
-| `-y`, `--yes` | keine Rückfrage |
-| `-v`, `--verbose` | die komplette neue `pyproject.toml` am Ende ausgeben |
-| `--timeout SEK` | Timeout je `uv`-Aufruf, Default 300s |
-| `--raw` | Pakete ganz ohne Versionsgrenze eintragen |
-| `--bounds {lower,major,minor,exact}` | Art der Versionsgrenze, die `uv add` setzt |
-| `--keep-lock` | `uv.lock` behalten (dann bevorzugt uv die alten Versionen) |
-| `--no-groups` | optional-dependencies und dependency-groups ignorieren |
-| `--drop-extras` | `fastapi[standard]` zu `fastapi` eindampfen |
-| `--drop-markers` | Environment-Marker verwerfen |
-| `--version` | Version von uv-refresh anzeigen |
+| `--path PATH` | different project directory (default: current) |
+| `--dry-run` | only show what would happen, touch nothing |
+| `-y`, `--yes` | run without asking for confirmation |
+| `-v`, `--verbose` | print the full new `pyproject.toml` at the end |
+| `--timeout SECONDS` | timeout per `uv` call, default 300s |
+| `--raw` | add packages with no version bound at all |
+| `--bounds {lower,major,minor,exact}` | kind of version bound `uv add` sets |
+| `--keep-lock` | keep `uv.lock` (uv will then prefer the old versions!) |
+| `--no-groups` | ignore optional-dependencies and dependency-groups |
+| `--drop-extras` | shrink `fastapi[standard]` down to `fastapi` |
+| `--drop-markers` | drop environment markers |
+| `--version` | show the uv-refresh version |
 
-## Achtung
+## Note
 
-Nur `dependencies`, `optional-dependencies` und `dependency-groups` werden
-neu geschrieben. Alles andere -- `description`, `readme`, `license`,
+Only `dependencies`, `optional-dependencies` and `dependency-groups` are
+rewritten. Everything else -- `description`, `readme`, `license`,
 `authors`, `keywords`, `[project.urls]`, `[project.scripts]`,
-`[build-system]`, `[tool.*]` und so weiter -- bleibt unverändert, weil es nie
-gelöscht wird: das Tool baut nur temporär eine minimale `pyproject.toml`
-zum Auflösen der Versionen, übernimmt daraus aber nur die frisch
-aufgelösten Dependency-Listen und schreibt die in eine Kopie der
-ursprünglichen Datei zurück.
+`[build-system]`, `[tool.*]` and so on -- stays unchanged, because it's
+never deleted: the tool only builds a minimal `pyproject.toml` temporarily
+to resolve versions, then takes just the freshly resolved dependency lists
+from it and writes those back into a copy of the original file.
 
-Einzige Ausnahme: mit `--no-groups` werden vorhandene
-`optional-dependencies`/`dependency-groups` absichtlich entfernt (das Tool
-warnt vorher). Einzelne Einträge, die sich nicht als PEP-508-String
-interpretieren lassen, werden pro Eintrag übersprungen und gemeldet.
+One exception: with `--no-groups`, any existing
+`optional-dependencies`/`dependency-groups` are intentionally removed (the
+tool warns beforehand). Individual entries that can't be interpreted as a
+PEP 508 string are skipped and reported per entry.
