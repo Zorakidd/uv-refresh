@@ -1,5 +1,4 @@
-"""
-uv-refresh
+"""uv-refresh
 ==========
 
 Baut die pyproject.toml eines uv-Projekts neu auf, damit alle Dependencies
@@ -9,9 +8,13 @@ Ablauf:
   1. pyproject.toml lesen und die Dependencies ohne Versionsangabe einsammeln
      (Extras und Environment-Marker bleiben erhalten, siehe --drop-extras)
   2. pyproject.toml + uv.lock in einen Backup-Ordner sichern
-  3. pyproject.toml (und optional uv.lock) loeschen
-  4. uv init --bare   ->  neue, minimale pyproject.toml
-  5. uv add <namen>   ->  uv loest die neueste kompatible Version auf
+  3. uv init --bare + uv add <namen> in einem Temp-Verzeichnis neben dem
+     Projekt ausfuehren -- die echte pyproject.toml bleibt dabei unangetastet
+  4. Ergebnis atomar an die Stelle der alten pyproject.toml/uv.lock setzen
+
+Schlaegt irgendein Schritt fehl (auch per Ctrl+C), wurde die echte
+pyproject.toml nie veraendert -- der komplette Aufbau geschah im
+Temp-Verzeichnis. Das Backup bleibt zusaetzlich als Referenz liegen.
 
 Benutzung:
   uv-refresh                 # im Projektverzeichnis, mit Rueckfrage
@@ -23,15 +26,19 @@ Benutzung:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
+
+from . import __version__
 
 try:  # bevorzugt der offizielle PEP-508-Parser
     from packaging.requirements import InvalidRequirement, Requirement
@@ -43,11 +50,18 @@ _SPEC_RE = re.compile(r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?P<extras>\[
 _VERSION_LINE_RE = re.compile(r'(?m)^version\s*=\s*"[^"]*"')
 
 C_OK, C_WARN, C_ERR, C_DIM, C_OFF = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
-_USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def _color_enabled(stream) -> bool:
+    return stream.isatty() and os.environ.get("NO_COLOR") is None
 
 
 def say(msg: str, color: str = "") -> None:
-    print(f"{color}{msg}{C_OFF}" if color and _USE_COLOR else msg)
+    # Fehler/Warnungen auf stderr: sonst verschwinden sie beim Umleiten von
+    # stdout (z. B. 'uv-refresh --dry-run > log.txt') spurlos.
+    stream = sys.stderr if color in (C_WARN, C_ERR) else sys.stdout
+    text = f"{color}{msg}{C_OFF}" if color and _color_enabled(stream) else msg
+    print(text, file=stream)
 
 
 def die(msg: str) -> NoReturn:
@@ -117,11 +131,83 @@ def specs_from(entries: list, keep_extras: bool, keep_markers: bool) -> list[str
     return out
 
 
-def run(cmd: list[str], cwd: Path, dry: bool) -> None:
+def resolve_groups(raw_groups: dict, keep_extras: bool, keep_markers: bool) -> dict[str, list[str]]:
+    """Loest 'include-group'-Eintraege (PEP 735) auf, bevor Specs eingesammelt werden.
+
+    Ohne das hier wuerde specs_from() jeden {include-group = "..."}-Eintrag nur
+    ueberspringen (mit Warnung) und die darueber eingebundenen Pakete
+    stillschweigend aus der neuen Gruppe verlieren.
+    """
+    flat: dict[str, list] = {}
+
+    def expand(grp: str, chain: tuple[str, ...] = ()) -> list:
+        if grp in flat:
+            return flat[grp]
+        if grp in chain:
+            raise RuntimeError(f"dependency-groups: Zirkel bei include-group '{grp}'")
+        if grp not in raw_groups:
+            raise RuntimeError(f"dependency-groups: include-group '{grp}' existiert nicht")
+        out: list = []
+        for entry in raw_groups[grp]:
+            if isinstance(entry, dict) and set(entry) == {"include-group"}:
+                out += expand(entry["include-group"], (*chain, grp))
+            else:
+                out.append(entry)
+        flat[grp] = out
+        return out
+
+    return {grp: specs_from(expand(grp), keep_extras, keep_markers) for grp in raw_groups}
+
+
+def ensure_backup_ignored(root: Path) -> None:
+    """Traegt '.uv-refresh-backup/' in die .gitignore ein, falls root ein Git-Repo ist.
+
+    Das Backup kann unveraendert uebernommene Direktquellen enthalten, z. B.
+    'pkg @ git+https://user:token@...' (siehe strip_version) -- ohne Eintrag
+    landet das leicht im naechsten 'git add .'.
+    """
+    if not (root / ".git").is_dir():
+        return
+    entry = ".uv-refresh-backup/"
+    gitignore = root / ".gitignore"
+    text = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
+    if entry in text.splitlines():
+        return
+    with gitignore.open("a", encoding="utf-8") as f:
+        if text and not text.endswith("\n"):
+            f.write("\n")
+        f.write(f"{entry}\n")
+    say(f"  {entry} zur .gitignore hinzugefuegt (Backup kann Zugangsdaten enthalten)", C_WARN)
+
+
+def build_init_cmd(name: str | None, requires_python: str | None, description: str | None) -> list[str]:
+    """Baut den 'uv init'-Aufruf.
+
+    Bindet Werte mit '=' statt als eigenes Argv-Token: eine description, die
+    mit '-' beginnt (z. B. '--experimental'), ist sonst nicht von einem Flag
+    zu unterscheiden und uv/clap lehnt den Aufruf mit 'unexpected argument' ab.
+    """
+    cmd = ["uv", "init", "--bare", "--no-workspace"]
+    if name:
+        cmd.append(f"--name={name}")
+    if requires_python:
+        cmd.append(f"--python={requires_python}")
+    if description:
+        cmd.append(f"--description={description}")
+    return cmd
+
+
+def run(cmd: list[str], cwd: Path, dry: bool, timeout: float | None = None) -> None:
     say(f"  $ {' '.join(cmd)}", C_DIM)
     if dry:
         return
-    if subprocess.run(cmd, cwd=cwd, check=False).returncode != 0:
+    try:
+        result = subprocess.run(cmd, cwd=cwd, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"Befehl lief laenger als {timeout:.0f}s und wurde abgebrochen: {' '.join(cmd)}"
+        ) from e
+    if result.returncode != 0:
         raise RuntimeError(f"Befehl fehlgeschlagen: {' '.join(cmd)}")
 
 
@@ -135,22 +221,41 @@ def restore_fields(text: str, version: str | None, readme: str | None) -> str:
     uv init setzt version IMMER auf "0.1.0" (kein --version-Flag vorhanden)
     und schreibt readme nie (nur als Datei, nicht als Feld). Ohne das hier
     wuerde eine bestehende Versionsnummer sonst still auf 0.1.0 zurueckfallen.
+
+    Ersetzt ueber eine Lambda-Funktion statt einen Text-String: re.sub()
+    interpretiert String-Replacements selbst wieder als Muster (\\1, \\g<...>);
+    eine Lambda gibt ihren Rueckgabewert dagegen immer woertlich ein. Und
+    .subn() statt .sub(): passt das Muster in einer kuenftigen uv-Version
+    nicht mehr (anderes Anfuehrungszeichen, andere Formatierung), gibt
+    re.sub() den Text sonst kommentarlos unveraendert zurueck -- die
+    Versionsnummer waere still auf 0.1.0 zurueckgefallen, ohne jede Meldung.
     """
     if version:
-        text = _VERSION_LINE_RE.sub(f"version = {_toml_string(version)}", text, count=1)
+        text, n = _VERSION_LINE_RE.subn(lambda _m: f"version = {_toml_string(version)}", text, count=1)
+        if n == 0:
+            say("  WARNUNG: version-Feld konnte nicht wiederhergestellt werden "
+                "(unerwartetes Format in der neuen pyproject.toml)", C_WARN)
     if readme:
-        text = re.sub(r"(?m)^(version\s*=.*)$",
-                       lambda m: f"{m.group(1)}\nreadme = {_toml_string(readme)}",
-                       text, count=1)
+        text, n = re.subn(r"(?m)^(version\s*=.*)$",
+                           lambda m: f"{m.group(1)}\nreadme = {_toml_string(readme)}",
+                           text, count=1)
+        if n == 0:
+            say("  WARNUNG: readme-Feld konnte nicht wiederhergestellt werden "
+                "(unerwartetes Format in der neuen pyproject.toml)", C_WARN)
     return text
 
 
 def main() -> int:
     p = argparse.ArgumentParser(prog="uv-refresh", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument("--path", default=".", help="Projektverzeichnis (Default: aktuelles)")
     p.add_argument("--dry-run", action="store_true", help="nur anzeigen, nichts veraendern")
     p.add_argument("--yes", "-y", action="store_true", help="ohne Rueckfrage durchziehen")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="komplette neue pyproject.toml am Ende ausgeben")
+    p.add_argument("--timeout", type=float, default=300.0,
+                   help="Timeout in Sekunden je uv-Aufruf (Default: 300)")
     p.add_argument("--keep-lock", action="store_true",
                    help="uv.lock behalten (dann bevorzugt uv die alten Versionen!)")
     p.add_argument("--no-groups", action="store_true",
@@ -201,8 +306,12 @@ def main() -> int:
     if not args.no_groups:
         for grp, specs in (project.get("optional-dependencies") or {}).items():
             extras[grp] = specs_from(specs, keep_extras, keep_markers)
-        for grp, specs in (data.get("dependency-groups") or {}).items():
-            groups[grp] = specs_from(specs, keep_extras, keep_markers)
+        raw_groups = data.get("dependency-groups") or {}
+        if raw_groups:
+            try:
+                groups = resolve_groups(raw_groups, keep_extras, keep_markers)
+            except RuntimeError as e:
+                die(str(e))
 
     if not main_deps and not extras and not groups:
         die("Keine Dependencies gefunden. Nichts zu tun.")
@@ -235,7 +344,7 @@ def main() -> int:
         say("\n--dry-run: ab hier wuerde passieren:", C_DIM)
     elif not args.yes:
         try:
-            answer = input("\nWirklich neu aufbauen? [j/N] ").strip().lower()
+            answer = input("\nWirklich neu aufbauen? [j/y/N] ").strip().lower()
         except EOFError:
             die("Keine Eingabe moeglich (kein Terminal). Mit --yes ohne Rueckfrage ausfuehren.")
         if answer not in {"j", "y"}:
@@ -246,72 +355,90 @@ def main() -> int:
     stamp = datetime.now(UTC).astimezone().strftime("%Y%m%d-%H%M%S")
     backup = root / ".uv-refresh-backup" / stamp
     say(f"\nBackup -> {backup}", C_DIM)
-    if not args.dry_run:
-        backup.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(pyproject, backup / "pyproject.toml")
-        if lock.is_file():
-            shutil.copy2(lock, backup / "uv.lock")
+    say("Aufbau erfolgt in einem Temp-Verzeichnis; deine echte pyproject.toml/"
+        "uv.lock bleiben bis zum letzten Schritt unangetastet.", C_DIM)
+
+    build_ctx = (tempfile.TemporaryDirectory(dir=root, prefix=".uv-refresh-tmp-")
+                 if not args.dry_run else contextlib.nullcontext(root))
 
     try:
-        # ---- 3. loeschen --------------------------------------------------
-        say("Loesche pyproject.toml" + ("" if args.keep_lock else " und uv.lock"), C_DIM)
         if not args.dry_run:
-            pyproject.unlink()
-            if lock.is_file() and not args.keep_lock:
-                lock.unlink()
+            ensure_backup_ignored(root)
+            backup.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(backup, 0o700)
+            except OSError:
+                pass
+            shutil.copy2(pyproject, backup / "pyproject.toml")
+            if lock.is_file():
+                shutil.copy2(lock, backup / "uv.lock")
 
-        # ---- 4. uv init ---------------------------------------------------
-        init = ["uv", "init", "--bare", "--no-workspace"]
-        if name:
-            init += ["--name", name]
-        if requires_python:
-            init += ["--python", requires_python]
-        if description:
-            init += ["--description", description]
-        try:
-            run(init, root, args.dry_run)
-        except RuntimeError:
-            if "--python" not in init:
-                raise
-            say("  uv init mit --python fehlgeschlagen, versuche es ohne", C_WARN)
-            i = init.index("--python")
-            run(init[:i] + init[i + 2:], root, args.dry_run)
+        with build_ctx as build_dir_raw:
+            build_dir = Path(build_dir_raw)
+            if not args.dry_run and args.keep_lock and lock.is_file():
+                shutil.copy2(lock, build_dir / "uv.lock")
 
-        # ---- 5. uv add ----------------------------------------------------
-        flags: list[str] = []
-        if args.raw:
-            flags.append("--raw")
-        if args.bounds:
-            flags += ["--bounds", args.bounds]
+            # ---- 3. uv init -----------------------------------------------
+            init = build_init_cmd(name, requires_python, description)
+            try:
+                run(init, build_dir, args.dry_run, args.timeout)
+            except RuntimeError:
+                if not any(f.startswith("--python=") for f in init):
+                    raise
+                say("  uv init mit --python fehlgeschlagen, versuche es ohne", C_WARN)
+                run([f for f in init if not f.startswith("--python=")],
+                    build_dir, args.dry_run, args.timeout)
 
-        if main_deps:
-            run(["uv", "add", *flags, *main_deps], root, args.dry_run)
-        for grp, deps in extras.items():
-            if deps:
-                run(["uv", "add", "--optional", grp, *flags, *deps], root, args.dry_run)
-        for grp, deps in groups.items():
-            if deps:
-                run(["uv", "add", "--group", grp, *flags, *deps], root, args.dry_run)
+            # ---- 4. uv add --------------------------------------------------
+            flags: list[str] = []
+            if args.raw:
+                flags.append("--raw")
+            if args.bounds:
+                flags += ["--bounds", args.bounds]
 
-        # ---- 6. version/readme zuruecksetzen -------------------------------
-        # uv init setzt version immer auf 0.1.0 und schreibt readme nie, s. restore_fields()
-        if not args.dry_run and (version or isinstance(readme, str)):
-            text = restore_fields(pyproject.read_text(encoding="utf-8"),
-                                   version, readme if isinstance(readme, str) else None)
-            pyproject.write_text(text, encoding="utf-8")
+            if main_deps:
+                run(["uv", "add", *flags, *main_deps], build_dir, args.dry_run, args.timeout)
+            for grp, deps in extras.items():
+                if deps:
+                    run(["uv", "add", "--optional", grp, *flags, *deps],
+                        build_dir, args.dry_run, args.timeout)
+            for grp, deps in groups.items():
+                if deps:
+                    run(["uv", "add", "--group", grp, *flags, *deps],
+                        build_dir, args.dry_run, args.timeout)
 
-    except Exception as e:  # noqa: BLE001 -- Notbremse: bei JEDEM Fehler (uv,
-        # Dateisystem, ...) den alten Stand zurueckholen, daher bewusst breit
+            # ---- 5. version/readme zuruecksetzen -----------------------------
+            if not args.dry_run and (version or isinstance(readme, str)):
+                text = restore_fields((build_dir / "pyproject.toml").read_text(encoding="utf-8"),
+                                       version, readme if isinstance(readme, str) else None)
+                (build_dir / "pyproject.toml").write_text(text, encoding="utf-8")
+
+            # ---- 6. atomarer Tausch -------------------------------------------
+            # root blieb bis hierher unveraendert: schlaegt oben etwas fehl
+            # (auch per Ctrl+C), gibt es nichts zurueckzuholen.
+            if not args.dry_run:
+                os.replace(build_dir / "pyproject.toml", pyproject)
+                new_lock = build_dir / "uv.lock"
+                if new_lock.is_file():
+                    os.replace(new_lock, lock)
+            else:
+                say("  $ (pyproject.toml/uv.lock wuerden jetzt atomar ersetzt)", C_DIM)
+
+    except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 -- Notbremse: bei
+        # JEDEM Fehler (uv, Dateisystem, Interrupt, ...) klar melden. Der Aufbau
+        # geschah in einem Temp-Verzeichnis, root ist daher normalerweise
+        # unveraendert; das Backup bleibt als zusaetzliches Netz trotzdem liegen.
         say(f"\n{e}", C_ERR)
         if not args.dry_run:
-            shutil.copy2(backup / "pyproject.toml", pyproject)
-            if (backup / "uv.lock").is_file():
-                shutil.copy2(backup / "uv.lock", lock)
-            say("pyproject.toml aus dem Backup wiederhergestellt.", C_WARN)
+            say(f"pyproject.toml unveraendert. Backup liegt in {backup}.", C_WARN)
         return 1
 
+    if args.dry_run:
+        say("\n--dry-run: nichts wurde veraendert.", C_OK)
+        return 0
+
     say("\nFertig.", C_OK)
-    if not args.dry_run and pyproject.is_file():
+    if args.verbose and pyproject.is_file():
         say(pyproject.read_text(encoding="utf-8"), C_DIM)
     return 0
 
