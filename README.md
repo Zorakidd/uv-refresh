@@ -1,21 +1,21 @@
 # uv-refresh
 
 Baut die `pyproject.toml` eines uv-Projekts neu auf, damit alle Dependencies
-frisch aufgeloest werden statt alte Versionsbindungen mitzuschleppen.
+frisch aufgelöst werden statt alte Versionsbindungen mitzuschleppen.
 
 ## Ablauf
 
 1. `pyproject.toml` lesen, Dependencies ohne Versionsangabe einsammeln
-   (Extras und Environment-Marker bleiben erhalten; `include-group`-Eintraege
-   aus `dependency-groups` werden dabei aufgeloest, nicht verworfen)
+   (Extras und Environment-Marker bleiben erhalten; `include-group`-Einträge
+   aus `dependency-groups` werden dabei aufgelöst, nicht verworfen)
 2. `pyproject.toml` und `uv.lock` nach `.uv-refresh-backup/<zeitstempel>/` sichern
 3. `uv init --bare` + `uv add <pakete>` in einem Temp-Verzeichnis neben dem
-   Projekt ausfuehren -- die echte `pyproject.toml` bleibt dabei unangetastet
+   Projekt ausführen -- die echte `pyproject.toml` bleibt dabei unangetastet
 4. Ergebnis atomar an die Stelle der alten `pyproject.toml`/`uv.lock` setzen
 
-Schlaegt ein Schritt fehl -- auch per Ctrl+C --, wurde die echte
-`pyproject.toml` nie veraendert, weil der komplette Aufbau im
-Temp-Verzeichnis geschah. Das Backup liegt zusaetzlich als Referenz bereit.
+Schlägt ein Schritt fehl -- auch per Ctrl+C --, wurde die echte
+`pyproject.toml` nie verändert, weil der komplette Aufbau im
+Temp-Verzeichnis geschah. Das Backup liegt zusätzlich als Referenz bereit.
 
 ## Installation
 
@@ -27,17 +27,17 @@ Oder ohne Installation, direkt aus dem Repo:
 
 ## Benutzung
 
-    uv-refresh --dry-run     # nur anzeigen, nichts veraendern
-    uv-refresh               # mit Rueckfrage durchziehen
-    uv-refresh -y            # ohne Rueckfrage
+    uv-refresh --dry-run     # nur anzeigen, nichts verändern
+    uv-refresh               # mit Rückfrage durchziehen
+    uv-refresh -y            # ohne Rückfrage
 
 ## Optionen
 
 | Flag | Wirkung |
 | --- | --- |
 | `--path PFAD` | anderes Projektverzeichnis (Default: aktuelles) |
-| `--dry-run` | zeigt nur, was passieren wuerde |
-| `-y`, `--yes` | keine Rueckfrage |
+| `--dry-run` | zeigt nur, was passieren würde |
+| `-y`, `--yes` | keine Rückfrage |
 | `-v`, `--verbose` | die komplette neue `pyproject.toml` am Ende ausgeben |
 | `--timeout SEK` | Timeout je `uv`-Aufruf, Default 300s |
 | `--raw` | Pakete ganz ohne Versionsgrenze eintragen |
@@ -50,7 +50,7 @@ Oder ohne Installation, direkt aus dem Repo:
 
 ## Achtung
 
-Alles ausser `[project]` und `[dependency-groups]` geht verloren, also
+Alles außer `[project]` und `[dependency-groups]` geht verloren, also
 `[build-system]`, `[tool.ruff]`, `[project.scripts]` und so weiter. Das Tool
-warnt vorher und listet die betroffenen Bloecke auf. Zurueckkopieren musst du
+warnt vorher und listet die betroffenen Blöcke auf. Zurückkopieren musst du
 sie von Hand aus dem Backup.
