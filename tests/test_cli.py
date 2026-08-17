@@ -1,4 +1,5 @@
 import sys
+import tomllib
 
 import pytest
 
@@ -33,7 +34,7 @@ def test_specs_from_dedupes_case_insensitively():
 def test_specs_from_skips_non_string_entries(capsys):
     result = cli.specs_from([{"include-group": "x"}], True, True)
     assert result == []
-    assert "uebersprungen" in capsys.readouterr().err
+    assert "skipped" in capsys.readouterr().err
 
 
 def test_resolve_groups_expands_include_group():
@@ -48,13 +49,13 @@ def test_resolve_groups_expands_include_group():
 
 def test_resolve_groups_detects_cycle():
     raw = {"a": [{"include-group": "b"}], "b": [{"include-group": "a"}]}
-    with pytest.raises(RuntimeError, match="Zirkel"):
+    with pytest.raises(RuntimeError, match="cycle"):
         cli.resolve_groups(raw, True, True)
 
 
 def test_resolve_groups_missing_group():
     raw = {"dev": [{"include-group": "missing"}]}
-    with pytest.raises(RuntimeError, match="existiert nicht"):
+    with pytest.raises(RuntimeError, match="does not exist"):
         cli.resolve_groups(raw, True, True)
 
 
@@ -77,25 +78,85 @@ def test_build_init_cmd_omits_missing_fields():
     assert cli.build_init_cmd(None, None, None) == ["uv", "init", "--bare", "--no-workspace"]
 
 
-def test_restore_fields_sets_version_and_readme():
-    text = 'name = "demo"\nversion = "0.1.0"\ndependencies = []\n'
-    out = cli.restore_fields(text, "1.2.3", "README.md")
-    assert 'version = "1.2.3"' in out
-    assert 'readme = "README.md"' in out
+_ORIGINAL_PYPROJECT = """\
+[project]
+name = "demo"
+version = "1.2.3"
+description = "a demo"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Zora" }]
+keywords = ["a", "b"]
+requires-python = ">=3.11"
+dependencies = ["requests>=2.0"]
+
+[project.urls]
+Homepage = "https://example.com"
+
+[project.scripts]
+demo = "demo:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+target-version = "py311"
+"""
 
 
-def test_restore_fields_warns_when_pattern_does_not_match(capsys):
-    # regression test: if a future uv ever changes formatting, this must not
-    # fail silently -- .sub() alone would return the text unchanged with no
-    # signal at all.
-    text = "name = 'x'\nversion = '0.1.0'\n"  # single quotes: real uv never emits this today
-    out = cli.restore_fields(text, "9.9.9", None)
-    assert out == text
-    assert "WARNUNG" in capsys.readouterr().err
+def test_merge_dependencies_replaces_only_dependencies():
+    merged = cli.merge_dependencies(_ORIGINAL_PYPROJECT, ["click>=8.1.0"], {}, {})
+    result = tomllib.loads(merged)
+    assert result["project"]["dependencies"] == ["click>=8.1.0"]
+
+
+def test_merge_dependencies_preserves_everything_else():
+    # regression test: uv-refresh used to rebuild pyproject.toml from
+    # scratch via 'uv init --bare', which only carries name/version/
+    # description/requires-python -- silently dropping readme, license,
+    # authors, keywords, [project.urls], [project.scripts], [build-system]
+    # and [tool.*] (discovered by running the tool on its own repo).
+    merged = cli.merge_dependencies(_ORIGINAL_PYPROJECT, ["click>=8.1.0"], {}, {})
+    result = tomllib.loads(merged)
+    project = result["project"]
+    assert project["version"] == "1.2.3"
+    assert project["description"] == "a demo"
+    assert project["readme"] == "README.md"
+    assert project["license"] == "MIT"
+    assert project["authors"] == [{"name": "Zora"}]
+    assert project["keywords"] == ["a", "b"]
+    assert project["requires-python"] == ">=3.11"
+    assert project["urls"]["Homepage"] == "https://example.com"
+    assert project["scripts"]["demo"] == "demo:main"
+    assert result["build-system"]["build-backend"] == "hatchling.build"
+    assert result["tool"]["ruff"]["target-version"] == "py311"
+
+
+def test_merge_dependencies_adds_groups():
+    original = '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = []\n'
+    merged = cli.merge_dependencies(
+        original, ["click"], {"speed": ["orjson"]}, {"dev": ["pytest", "ruff"]}
+    )
+    result = tomllib.loads(merged)
+    assert result["project"]["optional-dependencies"] == {"speed": ["orjson"]}
+    assert result["dependency-groups"] == {"dev": ["pytest", "ruff"]}
+
+
+def test_merge_dependencies_removes_groups_that_are_gone():
+    # e.g. what --no-groups produces: groups existed before, nothing to put
+    # back this time around.
+    with_groups = cli.merge_dependencies(
+        _ORIGINAL_PYPROJECT, ["click"], {"speed": ["orjson"]}, {"dev": ["pytest"]}
+    )
+    without_groups = cli.merge_dependencies(with_groups, ["click"], {}, {})
+    result = tomllib.loads(without_groups)
+    assert "optional-dependencies" not in result["project"]
+    assert "dependency-groups" not in result
 
 
 def test_run_raises_on_timeout(tmp_path):
-    with pytest.raises(RuntimeError, match="laenger als"):
+    with pytest.raises(RuntimeError, match="ran longer than"):
         cli.run([sys.executable, "-c", "import time; time.sleep(2)"], tmp_path,
                 dry=False, timeout=0.1)
 

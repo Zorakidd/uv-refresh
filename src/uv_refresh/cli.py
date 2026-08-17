@@ -1,26 +1,30 @@
 """uv-refresh
 ==========
 
-Baut die pyproject.toml eines uv-Projekts neu auf, damit alle Dependencies
-frisch aufgeloest werden statt alte Versionsbindungen mitzuschleppen.
+Rebuilds a uv project's pyproject.toml so every dependency gets freshly
+resolved instead of dragging along old version pins.
 
-Ablauf:
-  1. pyproject.toml lesen und die Dependencies ohne Versionsangabe einsammeln
-     (Extras und Environment-Marker bleiben erhalten, siehe --drop-extras)
-  2. pyproject.toml + uv.lock in einen Backup-Ordner sichern
-  3. uv init --bare + uv add <namen> in einem Temp-Verzeichnis neben dem
-     Projekt ausfuehren -- die echte pyproject.toml bleibt dabei unangetastet
-  4. Ergebnis atomar an die Stelle der alten pyproject.toml/uv.lock setzen
+Steps:
+  1. Read pyproject.toml and collect the dependencies without their version
+     specifiers (extras and environment markers are kept, see --drop-extras)
+  2. Back up pyproject.toml + uv.lock into a backup folder
+  3. Run uv init --bare + uv add <names> in a temp directory next to the
+     project -- the real pyproject.toml stays untouched the whole time
+  4. Merge only dependencies/optional-dependencies/dependency-groups from
+     the result into a copy of the ORIGINAL pyproject.toml -- everything
+     else (description, readme, license, authors, keywords, [project.urls],
+     [project.scripts], [build-system], [tool.*], ...) stays untouched
+  5. Atomically swap the result in place of the old pyproject.toml/uv.lock
 
-Schlaegt irgendein Schritt fehl (auch per Ctrl+C), wurde die echte
-pyproject.toml nie veraendert -- der komplette Aufbau geschah im
-Temp-Verzeichnis. Das Backup bleibt zusaetzlich als Referenz liegen.
+If any step fails -- including Ctrl+C -- the real pyproject.toml was never
+touched, since the whole build happened in the temp directory. The backup
+is kept around as an extra reference regardless.
 
-Benutzung:
-  uv-refresh                 # im Projektverzeichnis, mit Rueckfrage
-  uv-refresh --dry-run       # nur zeigen, nichts anfassen
-  uv-refresh --raw           # ganz ohne Versionsangabe eintragen
-  uv-refresh --path ../other # anderes Projektverzeichnis
+Usage:
+  uv-refresh                 # in the project directory, asks for confirmation
+  uv-refresh --dry-run       # just show what would happen, touch nothing
+  uv-refresh --raw           # add packages with no version bound at all
+  uv-refresh --path ../other # a different project directory
 """
 
 from __future__ import annotations
@@ -38,6 +42,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
 
+import tomlkit
+
 from . import __version__
 
 try:  # bevorzugt der offizielle PEP-508-Parser
@@ -47,7 +53,6 @@ except ModuleNotFoundError:  # Fallback, damit das Skript auch nackt laeuft
     InvalidRequirement = ValueError  # type: ignore[assignment,misc]
 
 _SPEC_RE = re.compile(r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?P<extras>\[[^\]]*\])?")
-_VERSION_LINE_RE = re.compile(r'(?m)^version\s*=\s*"[^"]*"')
 
 C_OK, C_WARN, C_ERR, C_DIM, C_OFF = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
 
@@ -65,7 +70,7 @@ def say(msg: str, color: str = "") -> None:
 
 
 def die(msg: str) -> NoReturn:
-    say(f"FEHLER: {msg}", C_ERR)
+    say(f"ERROR: {msg}", C_ERR)
     sys.exit(1)
 
 
@@ -119,14 +124,14 @@ def specs_from(entries: list, keep_extras: bool, keep_markers: bool) -> list[str
     seen: set[str] = set()
     for entry in entries:
         if not isinstance(entry, str):  # z. B. {include-group = "..."}
-            say(f"  uebersprungen (kein PEP-508-String): {entry!r}", C_WARN)
+            say(f"  skipped (not a PEP 508 string): {entry!r}", C_WARN)
             continue
         spec = strip_version(entry, keep_extras, keep_markers)
         if not spec or spec.lower() in seen:
             continue
         seen.add(spec.lower())
         if "@" in spec:
-            say(f"  {spec}: direkte Quelle, bleibt unveraendert", C_WARN)
+            say(f"  {spec}: direct reference, left unchanged", C_WARN)
         out.append(spec)
     return out
 
@@ -144,9 +149,9 @@ def resolve_groups(raw_groups: dict, keep_extras: bool, keep_markers: bool) -> d
         if grp in flat:
             return flat[grp]
         if grp in chain:
-            raise RuntimeError(f"dependency-groups: Zirkel bei include-group '{grp}'")
+            raise RuntimeError(f"dependency-groups: cycle at include-group '{grp}'")
         if grp not in raw_groups:
-            raise RuntimeError(f"dependency-groups: include-group '{grp}' existiert nicht")
+            raise RuntimeError(f"dependency-groups: include-group '{grp}' does not exist")
         out: list = []
         for entry in raw_groups[grp]:
             if isinstance(entry, dict) and set(entry) == {"include-group"}:
@@ -177,7 +182,7 @@ def ensure_backup_ignored(root: Path) -> None:
         if text and not text.endswith("\n"):
             f.write("\n")
         f.write(f"{entry}\n")
-    say(f"  {entry} zur .gitignore hinzugefuegt (Backup kann Zugangsdaten enthalten)", C_WARN)
+    say(f"  added {entry} to .gitignore (backup may contain credentials)", C_WARN)
 
 
 def build_init_cmd(name: str | None, requires_python: str | None, description: str | None) -> list[str]:
@@ -205,70 +210,82 @@ def run(cmd: list[str], cwd: Path, dry: bool, timeout: float | None = None) -> N
         result = subprocess.run(cmd, cwd=cwd, check=False, timeout=timeout)
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(
-            f"Befehl lief laenger als {timeout:.0f}s und wurde abgebrochen: {' '.join(cmd)}"
+            f"Command ran longer than {timeout:.0f}s and was aborted: {' '.join(cmd)}"
         ) from e
     if result.returncode != 0:
-        raise RuntimeError(f"Befehl fehlgeschlagen: {' '.join(cmd)}")
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
 
 
-def _toml_string(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+def _toml_array(values: list[str]):
+    arr = tomlkit.array()
+    for v in values:
+        arr.append(v)
+    if values:
+        arr.multiline(True)
+    return arr
 
 
-def restore_fields(text: str, version: str | None, readme: str | None) -> str:
-    """Setzt version/readme zurueck, die 'uv init --bare' nicht uebernimmt.
+def _toml_group_table(groups: dict[str, list[str]]):
+    table = tomlkit.table()
+    for grp, specs in groups.items():
+        table[grp] = _toml_array(specs)
+    return table
 
-    uv init setzt version IMMER auf "0.1.0" (kein --version-Flag vorhanden)
-    und schreibt readme nie (nur als Datei, nicht als Feld). Ohne das hier
-    wuerde eine bestehende Versionsnummer sonst still auf 0.1.0 zurueckfallen.
 
-    Ersetzt ueber eine Lambda-Funktion statt einen Text-String: re.sub()
-    interpretiert String-Replacements selbst wieder als Muster (\\1, \\g<...>);
-    eine Lambda gibt ihren Rueckgabewert dagegen immer woertlich ein. Und
-    .subn() statt .sub(): passt das Muster in einer kuenftigen uv-Version
-    nicht mehr (anderes Anfuehrungszeichen, andere Formatierung), gibt
-    re.sub() den Text sonst kommentarlos unveraendert zurueck -- die
-    Versionsnummer waere still auf 0.1.0 zurueckgefallen, ohne jede Meldung.
+def merge_dependencies(original_text: str, new_deps: list[str],
+                        new_extras: dict[str, list[str]], new_groups: dict[str, list[str]]) -> str:
+    """Schreibt frisch aufgeloeste Dependencies in eine Kopie der ORIGINALEN
+    pyproject.toml, statt sie in eine von 'uv init --bare' neu angelegte
+    zurueckzupatchen.
+
+    dependencies/optional-dependencies/dependency-groups werden ersetzt (oder
+    entfernt, wenn nichts mehr uebrig ist -- z. B. durch --no-groups). Alles
+    andere -- description, readme, license, authors, keywords,
+    [project.urls], [project.scripts], [build-system], [tool.*], ... -- wird
+    nie angefasst, weil es nie geloescht wurde. tomlkit erhaelt dabei
+    Formatierung und Kommentare des Originals, statt es platt neu zu
+    serialisieren.
     """
-    if version:
-        text, n = _VERSION_LINE_RE.subn(lambda _m: f"version = {_toml_string(version)}", text, count=1)
-        if n == 0:
-            say("  WARNUNG: version-Feld konnte nicht wiederhergestellt werden "
-                "(unerwartetes Format in der neuen pyproject.toml)", C_WARN)
-    if readme:
-        text, n = re.subn(r"(?m)^(version\s*=.*)$",
-                           lambda m: f"{m.group(1)}\nreadme = {_toml_string(readme)}",
-                           text, count=1)
-        if n == 0:
-            say("  WARNUNG: readme-Feld konnte nicht wiederhergestellt werden "
-                "(unerwartetes Format in der neuen pyproject.toml)", C_WARN)
-    return text
+    doc = tomlkit.parse(original_text)
+    doc["project"]["dependencies"] = _toml_array(new_deps)
+
+    if new_extras:
+        doc["project"]["optional-dependencies"] = _toml_group_table(new_extras)
+    elif "optional-dependencies" in doc["project"]:
+        del doc["project"]["optional-dependencies"]
+
+    if new_groups:
+        doc["dependency-groups"] = _toml_group_table(new_groups)
+    elif "dependency-groups" in doc:
+        del doc["dependency-groups"]
+
+    return tomlkit.dumps(doc)
 
 
 def main() -> int:
     p = argparse.ArgumentParser(prog="uv-refresh", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    p.add_argument("--path", default=".", help="Projektverzeichnis (Default: aktuelles)")
-    p.add_argument("--dry-run", action="store_true", help="nur anzeigen, nichts veraendern")
-    p.add_argument("--yes", "-y", action="store_true", help="ohne Rueckfrage durchziehen")
+    p.add_argument("--path", default=".", help="project directory (default: current)")
+    p.add_argument("--dry-run", action="store_true", help="only show what would happen, change nothing")
+    p.add_argument("--yes", "-y", action="store_true", help="run without asking for confirmation")
     p.add_argument("--verbose", "-v", action="store_true",
-                   help="komplette neue pyproject.toml am Ende ausgeben")
+                   help="print the full new pyproject.toml at the end")
     p.add_argument("--timeout", type=float, default=300.0,
-                   help="Timeout in Sekunden je uv-Aufruf (Default: 300)")
+                   help="timeout in seconds per uv call (default: 300)")
     p.add_argument("--keep-lock", action="store_true",
-                   help="uv.lock behalten (dann bevorzugt uv die alten Versionen!)")
+                   help="keep uv.lock (uv will then prefer the old versions!)")
     p.add_argument("--no-groups", action="store_true",
-                   help="optional-dependencies und dependency-groups nicht uebernehmen")
+                   help="don't carry over optional-dependencies and dependency-groups")
     p.add_argument("--drop-extras", action="store_true",
-                   help="Extras verwerfen: fastapi[standard] wird zu fastapi (selten sinnvoll!)")
+                   help="drop extras: fastapi[standard] becomes fastapi (rarely useful!)")
     p.add_argument("--drop-markers", action="store_true",
-                   help="Environment-Marker verwerfen, z. B. ; sys_platform == 'win32'")
+                   help="drop environment markers, e.g. ; sys_platform == 'win32'")
     bounds_group = p.add_mutually_exclusive_group()
     bounds_group.add_argument("--raw", action="store_true",
-                   help="Namen komplett ohne Versionsgrenze eintragen (uv add --raw)")
+                   help="add package names with no version bound at all (uv add --raw)")
     bounds_group.add_argument("--bounds", choices=["lower", "major", "minor", "exact"],
-                   help="Art der Versionsgrenze, die uv add setzt (Preview-Feature von uv)")
+                   help="kind of version bound uv add sets (uv preview feature)")
     args = p.parse_args()
 
     root = Path(args.path).resolve()
@@ -276,28 +293,27 @@ def main() -> int:
     lock = root / "uv.lock"
 
     if not shutil.which("uv"):
-        die("uv ist nicht im PATH.")
+        die("uv is not on PATH.")
     if not pyproject.is_file():
-        die(f"Keine pyproject.toml in {root}")
+        die(f"No pyproject.toml in {root}")
 
     # ---- 1. lesen ---------------------------------------------------------
     try:
-        with pyproject.open("rb") as f:
-            data = tomllib.load(f)
-    except tomllib.TOMLDecodeError as e:
-        die(f"pyproject.toml ist kein gueltiges TOML: {e}")
+        original_text = pyproject.read_text(encoding="utf-8")
     except UnicodeDecodeError as e:
-        die(f"pyproject.toml ist nicht UTF-8-kodiert: {e}")
+        die(f"pyproject.toml is not UTF-8 encoded: {e}")
+    try:
+        data = tomllib.loads(original_text)
+    except tomllib.TOMLDecodeError as e:
+        die(f"pyproject.toml is not valid TOML: {e}")
 
     project = data.get("project", {})
     if not project:
-        die("Kein [project]-Abschnitt gefunden. Ist das ein uv-/PEP-621-Projekt?")
+        die("No [project] section found. Is this a uv/PEP 621 project?")
 
     name = project.get("name")
     requires_python = project.get("requires-python")
     description = project.get("description")
-    version = project.get("version")
-    readme = project.get("readme")
     keep_extras, keep_markers = not args.drop_extras, not args.drop_markers
     main_deps = specs_from(project.get("dependencies", []), keep_extras, keep_markers)
 
@@ -314,49 +330,41 @@ def main() -> int:
                 die(str(e))
 
     if not main_deps and not extras and not groups:
-        die("Keine Dependencies gefunden. Nichts zu tun.")
+        die("No dependencies found. Nothing to do.")
 
-    say(f"\nProjekt: {name or '(kein Name)'}   [{root}]", C_OK)
+    say(f"\nProject: {name or '(no name)'}   [{root}]", C_OK)
     say(f"  dependencies      : {', '.join(main_deps) or '-'}")
     for g, n in extras.items():
         say(f"  optional [{g}]    : {', '.join(n)}")
     for g, n in groups.items():
         say(f"  group [{g}]       : {', '.join(n)}")
 
-    # ---- Was verloren geht ------------------------------------------------
-    # version/description werden aktiv wiederhergestellt (s. u.), readme nur
-    # als einfacher String -- als Tabelle ({file=..., text=...}) nicht.
-    safe_keys = {"name", "version", "description", "requires-python",
-                 "dependencies", "optional-dependencies"}
-    if isinstance(readme, str):
-        safe_keys.add("readme")
-    lost = [k for k in project if k not in safe_keys]
-    other_tables = [k for k in data if k not in {"project", "dependency-groups"}]
-    if lost or other_tables:
-        say("\nACHTUNG, diese Konfiguration wird NICHT wiederhergestellt:", C_WARN)
-        for k in lost:
-            say(f"  [project].{k}", C_WARN)
-        for k in other_tables:
-            say(f"  [{k}]", C_WARN)
-        say("  Das Backup liegt daneben, du musst diese Bloecke von Hand zurueckkopieren.", C_WARN)
+    # ---- Was sich aendert ---------------------------------------------------
+    # dependencies/optional-dependencies/dependency-groups werden ersetzt,
+    # alles andere (description, readme, license, authors, keywords,
+    # [project.urls], [project.scripts], [build-system], [tool.*], ...)
+    # bleibt unangetastet -- siehe merge_dependencies().
+    if args.no_groups and (project.get("optional-dependencies") or data.get("dependency-groups")):
+        say("\n--no-groups: existing optional-dependencies/dependency-groups "
+            "will be removed from the new pyproject.toml.", C_WARN)
 
     if args.dry_run:
-        say("\n--dry-run: ab hier wuerde passieren:", C_DIM)
+        say("\n--dry-run: from here on, this would happen:", C_DIM)
     elif not args.yes:
         try:
-            answer = input("\nWirklich neu aufbauen? [j/y/N] ").strip().lower()
+            answer = input("\nRebuild pyproject.toml now? [y/N] ").strip().lower()
         except EOFError:
-            die("Keine Eingabe moeglich (kein Terminal). Mit --yes ohne Rueckfrage ausfuehren.")
-        if answer not in {"j", "y"}:
-            say("Abgebrochen.", C_DIM)
+            die("No input possible (no terminal). Use --yes to run without confirmation.")
+        if answer != "y":
+            say("Aborted.", C_DIM)
             return 1
 
     # ---- 2. Backup --------------------------------------------------------
     stamp = datetime.now(UTC).astimezone().strftime("%Y%m%d-%H%M%S")
     backup = root / ".uv-refresh-backup" / stamp
     say(f"\nBackup -> {backup}", C_DIM)
-    say("Aufbau erfolgt in einem Temp-Verzeichnis; deine echte pyproject.toml/"
-        "uv.lock bleiben bis zum letzten Schritt unangetastet.", C_DIM)
+    say("Building in a temp directory; your real pyproject.toml/uv.lock "
+        "stay untouched until the final step.", C_DIM)
 
     build_ctx = (tempfile.TemporaryDirectory(dir=root, prefix=".uv-refresh-tmp-")
                  if not args.dry_run else contextlib.nullcontext(root))
@@ -385,7 +393,7 @@ def main() -> int:
             except RuntimeError:
                 if not any(f.startswith("--python=") for f in init):
                     raise
-                say("  uv init mit --python fehlgeschlagen, versuche es ohne", C_WARN)
+                say("  uv init with --python failed, retrying without it", C_WARN)
                 run([f for f in init if not f.startswith("--python=")],
                     build_dir, args.dry_run, args.timeout)
 
@@ -407,11 +415,17 @@ def main() -> int:
                     run(["uv", "add", "--group", grp, *flags, *deps],
                         build_dir, args.dry_run, args.timeout)
 
-            # ---- 5. version/readme zuruecksetzen -----------------------------
-            if not args.dry_run and (version or isinstance(readme, str)):
-                text = restore_fields((build_dir / "pyproject.toml").read_text(encoding="utf-8"),
-                                       version, readme if isinstance(readme, str) else None)
-                (build_dir / "pyproject.toml").write_text(text, encoding="utf-8")
+            # ---- 5. Dependencies in die ORIGINALE pyproject.toml einmergen ----
+            if not args.dry_run:
+                built = tomllib.loads((build_dir / "pyproject.toml").read_text(encoding="utf-8"))
+                built_project = built.get("project", {})
+                merged = merge_dependencies(
+                    original_text,
+                    built_project.get("dependencies", []),
+                    built_project.get("optional-dependencies", {}),
+                    built.get("dependency-groups", {}),
+                )
+                (build_dir / "pyproject.toml").write_text(merged, encoding="utf-8")
 
             # ---- 6. atomarer Tausch -------------------------------------------
             # root blieb bis hierher unveraendert: schlaegt oben etwas fehl
@@ -422,7 +436,7 @@ def main() -> int:
                 if new_lock.is_file():
                     os.replace(new_lock, lock)
             else:
-                say("  $ (pyproject.toml/uv.lock wuerden jetzt atomar ersetzt)", C_DIM)
+                say("  $ (pyproject.toml/uv.lock would now be atomically replaced)", C_DIM)
 
     except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 -- Notbremse: bei
         # JEDEM Fehler (uv, Dateisystem, Interrupt, ...) klar melden. Der Aufbau
@@ -430,14 +444,14 @@ def main() -> int:
         # unveraendert; das Backup bleibt als zusaetzliches Netz trotzdem liegen.
         say(f"\n{e}", C_ERR)
         if not args.dry_run:
-            say(f"pyproject.toml unveraendert. Backup liegt in {backup}.", C_WARN)
+            say(f"pyproject.toml unchanged. Backup is at {backup}.", C_WARN)
         return 1
 
     if args.dry_run:
-        say("\n--dry-run: nichts wurde veraendert.", C_OK)
+        say("\n--dry-run: nothing was changed.", C_OK)
         return 0
 
-    say("\nFertig.", C_OK)
+    say("\nDone.", C_OK)
     if args.verbose and pyproject.is_file():
         say(pyproject.read_text(encoding="utf-8"), C_DIM)
     return 0
