@@ -1,6 +1,6 @@
 [project]
 name = "uv-refresh"
-version = "0.1.0"
+version = "0.1.1"
 description = "Baut die pyproject.toml eines uv-Projekts neu auf, damit alle Dependencies frisch aufgelöst und geupdatet werden"
 readme = "README.md"
 license = "MIT"
