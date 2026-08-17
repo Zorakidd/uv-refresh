@@ -6,14 +6,16 @@ frisch aufgeloest werden statt alte Versionsbindungen mitzuschleppen.
 ## Ablauf
 
 1. `pyproject.toml` lesen, Dependencies ohne Versionsangabe einsammeln
-   (Extras und Environment-Marker bleiben erhalten)
+   (Extras und Environment-Marker bleiben erhalten; `include-group`-Eintraege
+   aus `dependency-groups` werden dabei aufgeloest, nicht verworfen)
 2. `pyproject.toml` und `uv.lock` nach `.uv-refresh-backup/<zeitstempel>/` sichern
-3. beide loeschen
-4. `uv init --bare` fuer eine neue, minimale `pyproject.toml`
-5. `uv add <pakete>`, uv loest die neueste kompatible Version auf
+3. `uv init --bare` + `uv add <pakete>` in einem Temp-Verzeichnis neben dem
+   Projekt ausfuehren -- die echte `pyproject.toml` bleibt dabei unangetastet
+4. Ergebnis atomar an die Stelle der alten `pyproject.toml`/`uv.lock` setzen
 
-Bricht ein Schritt ab, wird der alte Stand automatisch aus dem Backup
-wiederhergestellt.
+Schlaegt ein Schritt fehl -- auch per Ctrl+C --, wurde die echte
+`pyproject.toml` nie veraendert, weil der komplette Aufbau im
+Temp-Verzeichnis geschah. Das Backup liegt zusaetzlich als Referenz bereit.
 
 ## Installation
 
@@ -36,12 +38,15 @@ Oder ohne Installation, direkt aus dem Repo:
 | `--path PFAD` | anderes Projektverzeichnis (Default: aktuelles) |
 | `--dry-run` | zeigt nur, was passieren wuerde |
 | `-y`, `--yes` | keine Rueckfrage |
+| `-v`, `--verbose` | die komplette neue `pyproject.toml` am Ende ausgeben |
+| `--timeout SEK` | Timeout je `uv`-Aufruf, Default 300s |
 | `--raw` | Pakete ganz ohne Versionsgrenze eintragen |
 | `--bounds {lower,major,minor,exact}` | Art der Versionsgrenze, die `uv add` setzt |
 | `--keep-lock` | `uv.lock` behalten (dann bevorzugt uv die alten Versionen) |
 | `--no-groups` | optional-dependencies und dependency-groups ignorieren |
 | `--drop-extras` | `fastapi[standard]` zu `fastapi` eindampfen |
 | `--drop-markers` | Environment-Marker verwerfen |
+| `--version` | Version von uv-refresh anzeigen |
 
 ## Achtung
 
