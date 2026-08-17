@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.11"
-# dependencies = ["packaging"]
-# ///
 """
 uv-refresh
 ==========
@@ -19,10 +14,10 @@ Ablauf:
   5. uv add <namen>   ->  uv loest die neueste kompatible Version auf
 
 Benutzung:
-  uv run uv_refresh.py                 # im Projektverzeichnis
-  uv run uv_refresh.py --dry-run       # nur zeigen, nichts anfassen
-  uv run uv_refresh.py --raw           # ganz ohne Versionsangabe eintragen
-  uv run uv_refresh.py --path ../other # anderes Projektverzeichnis
+  uv-refresh                 # im Projektverzeichnis, mit Rueckfrage
+  uv-refresh --dry-run       # nur zeigen, nichts anfassen
+  uv-refresh --raw           # ganz ohne Versionsangabe eintragen
+  uv-refresh --path ../other # anderes Projektverzeichnis
 """
 
 from __future__ import annotations

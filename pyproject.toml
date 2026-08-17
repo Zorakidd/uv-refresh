@@ -1,0 +1,22 @@
+[project]
+name = "uv-refresh"
+version = "0.1.0"
+description = "Baut die pyproject.toml eines uv-Projekts neu auf, damit alle Dependencies frisch aufgelöst und geupdatet werden"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Zora" }]
+keywords = ["uv", "pyproject", "dependencies", "upgrade"]
+requires-python = ">=3.11"
+dependencies = [
+    "packaging>=26.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/Zorakidd/uv-refresh"
+
+[project.scripts]
+uv-refresh = "uv_refresh.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
