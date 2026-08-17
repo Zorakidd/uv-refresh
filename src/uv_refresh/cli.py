@@ -29,7 +29,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
 
@@ -121,7 +121,7 @@ def run(cmd: list[str], cwd: Path, dry: bool) -> None:
     say(f"  $ {' '.join(cmd)}", C_DIM)
     if dry:
         return
-    if subprocess.run(cmd, cwd=cwd).returncode != 0:
+    if subprocess.run(cmd, cwd=cwd, check=False).returncode != 0:
         raise RuntimeError(f"Befehl fehlgeschlagen: {' '.join(cmd)}")
 
 
@@ -243,7 +243,7 @@ def main() -> int:
             return 1
 
     # ---- 2. Backup --------------------------------------------------------
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(UTC).astimezone().strftime("%Y%m%d-%H%M%S")
     backup = root / ".uv-refresh-backup" / stamp
     say(f"\nBackup -> {backup}", C_DIM)
     if not args.dry_run:
