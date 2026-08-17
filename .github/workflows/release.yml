@@ -13,12 +13,15 @@ on:
           - minor
           - major
 
-permissions:
-  contents: write
-
 jobs:
   release:
     runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/uv-refresh/
+    permissions:
+      contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -46,12 +49,18 @@ jobs:
           git tag "v${{ steps.bump.outputs.version }}"
           git push origin HEAD --tags
 
+      - name: Build distribution
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
       - name: Create GitHub release
-        # A release created with the default GITHUB_TOKEN does not trigger
-        # other workflows (GitHub's anti-recursion rule) -- publish.yml's
-        # "on: release: published" would never fire, so v0.1.1/v0.1.2 never
-        # reached PyPI. RELEASE_TOKEN must be a PAT (fine-grained, "Contents:
-        # write" on this repo) stored as a repository secret.
+        # Nur noch fuer die Changelog-Seite auf GitHub -- publish ist zu diesem
+        # Zeitpunkt schon passiert, haengt also nicht mehr am 'release:
+        # published'-Event und braucht darum keinen PAT mehr (der Standard-
+        # GITHUB_TOKEN loest zwar keine anderen Workflows aus, aber es gibt
+        # hier auch keinen anderen Workflow mehr, der darauf wartet).
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: gh release create "v${{ steps.bump.outputs.version }}" --generate-notes
