@@ -11,7 +11,10 @@ frisch aufgelöst werden statt alte Versionsbindungen mitzuschleppen.
 2. `pyproject.toml` und `uv.lock` nach `.uv-refresh-backup/<zeitstempel>/` sichern
 3. `uv init --bare` + `uv add <pakete>` in einem Temp-Verzeichnis neben dem
    Projekt ausführen -- die echte `pyproject.toml` bleibt dabei unangetastet
-4. Ergebnis atomar an die Stelle der alten `pyproject.toml`/`uv.lock` setzen
+4. Nur `dependencies`/`optional-dependencies`/`dependency-groups` aus dem
+   Ergebnis in eine Kopie der ORIGINALEN `pyproject.toml` einmergen -- alles
+   andere bleibt unangetastet
+5. Ergebnis atomar an die Stelle der alten `pyproject.toml`/`uv.lock` setzen
 
 Schlägt ein Schritt fehl -- auch per Ctrl+C --, wurde die echte
 `pyproject.toml` nie verändert, weil der komplette Aufbau im
@@ -19,11 +22,17 @@ Temp-Verzeichnis geschah. Das Backup liegt zusätzlich als Referenz bereit.
 
 ## Installation
 
+    uv tool install uv-refresh
+
+Macht `uv-refresh` dauerhaft als Befehl verfügbar (global im PATH).
+
+Für einen einmaligen Testlauf, ganz ohne etwas zu installieren:
+
+    uvx uv-refresh --dry-run
+
+Oder direkt aus dem Repo, z. B. um einen unveröffentlichten Stand zu testen:
+
     uv tool install git+https://github.com/Zorakidd/uv-refresh
-
-Oder ohne Installation, direkt aus dem Repo:
-
-    uvx --from git+https://github.com/Zorakidd/uv-refresh uv-refresh --dry-run
 
 ## Benutzung
 
@@ -50,7 +59,16 @@ Oder ohne Installation, direkt aus dem Repo:
 
 ## Achtung
 
-Alles außer `[project]` und `[dependency-groups]` geht verloren, also
-`[build-system]`, `[tool.ruff]`, `[project.scripts]` und so weiter. Das Tool
-warnt vorher und listet die betroffenen Blöcke auf. Zurückkopieren musst du
-sie von Hand aus dem Backup.
+Nur `dependencies`, `optional-dependencies` und `dependency-groups` werden
+neu geschrieben. Alles andere -- `description`, `readme`, `license`,
+`authors`, `keywords`, `[project.urls]`, `[project.scripts]`,
+`[build-system]`, `[tool.*]` und so weiter -- bleibt unverändert, weil es nie
+gelöscht wird: das Tool baut nur temporär eine minimale `pyproject.toml`
+zum Auflösen der Versionen, übernimmt daraus aber nur die frisch
+aufgelösten Dependency-Listen und schreibt die in eine Kopie der
+ursprünglichen Datei zurück.
+
+Einzige Ausnahme: mit `--no-groups` werden vorhandene
+`optional-dependencies`/`dependency-groups` absichtlich entfernt (das Tool
+warnt vorher). Einzelne Einträge, die sich nicht als PEP-508-String
+interpretieren lassen, werden pro Eintrag übersprungen und gemeldet.
