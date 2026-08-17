@@ -45,7 +45,7 @@ def say(msg: str, color: str = "") -> None:
     print(f"{color}{msg}{C_OFF}" if color else msg)
 
 
-def die(msg: str) -> "None":
+def die(msg: str) -> None:
     say(f"FEHLER: {msg}", C_ERR)
     sys.exit(1)
 
