@@ -47,6 +47,11 @@ jobs:
           git push origin HEAD --tags
 
       - name: Create GitHub release
+        # A release created with the default GITHUB_TOKEN does not trigger
+        # other workflows (GitHub's anti-recursion rule) -- publish.yml's
+        # "on: release: published" would never fire, so v0.1.1/v0.1.2 never
+        # reached PyPI. RELEASE_TOKEN must be a PAT (fine-grained, "Contents:
+        # write" on this repo) stored as a repository secret.
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
         run: gh release create "v${{ steps.bump.outputs.version }}" --generate-notes
