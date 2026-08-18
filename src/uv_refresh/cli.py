@@ -443,6 +443,13 @@ def build_and_swap(root: Path, pyproject: Path, lock: Path, backup: Path,
             )
             (build_dir / "pyproject.toml").write_text(merged, encoding="utf-8")
 
+            # uv.lock im Temp-Verzeichnis wurde bisher gegen die BARE uv-init-Datei
+            # aufgeloest (kein [build-system], keine Version -> virtual/0.1.0). Die
+            # eben gemergte pyproject.toml hat jetzt wieder Version/[build-system]/etc.
+            # aus dem Original -- ohne Neuauflösung hier würde genau diese veraltete
+            # Lock-Datei gleich unveraendert ins echte Projekt geswapt.
+            run(["uv", "lock"], build_dir, args.dry_run, args.timeout)
+
         # ---- 6. atomarer Tausch -------------------------------------------
         # root blieb bis hierher unveraendert: schlaegt oben etwas fehl
         # (auch per Ctrl+C), gibt es nichts zurueckzuholen.
