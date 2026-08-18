@@ -9,3 +9,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # uv.lock is dev/CI-only -- it's never shipped in the published wheel/sdist,
+    # so end users never see it. Scoped to dev deps (ruff/pytest/ty) so this
+    # keeps CI tooling current without opening no-op PRs for packaging/tomlkit,
+    # whose >= floors barely matter for a library with permissive constraints.
+    allow:
+      - dependency-type: "development"
