@@ -55,13 +55,10 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          # Fallback via API token, solange der Trusted-Publisher-Eintrag auf
-          # PyPI noch auf den alten Workflow-Namen (publish.yml) zeigt. Sobald
-          # das dort auf release.yml korrigiert ist, kann PYPI_API_TOKEN als
-          # Secret wieder entfernt werden -- die Action faellt dann automatisch
-          # auf Trusted Publishing (id-token: write, oben) zurueck.
-          password: ${{ secrets.PYPI_API_TOKEN }}
+        # Trusted Publishing (OIDC, id-token: write oben) -- der Trusted-
+        # Publisher-Eintrag auf PyPI zeigt jetzt auf release.yml/pypi.
+        # Kein password mehr noetig; PYPI_API_TOKEN kann aus den Repo-
+        # Secrets geloescht und auf PyPI revoked werden.
 
       - name: Create GitHub release
         # Nur noch fuer die Changelog-Seite auf GitHub -- publish ist zu diesem
