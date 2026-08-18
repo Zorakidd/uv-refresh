@@ -48,10 +48,12 @@ Or straight from the repo, e.g. to try an unreleased version:
 | `--dry-run` | only show what would happen, touch nothing |
 | `-y`, `--yes` | run without asking for confirmation |
 | `-v`, `--verbose` | print the full new `pyproject.toml` at the end |
+| `-q`, `--quiet` | only print warnings/errors, no status output |
 | `--timeout SECONDS` | timeout per `uv` call, default 300s |
 | `--raw` | add packages with no version bound at all |
 | `--bounds {lower,major,minor,exact}` | kind of version bound `uv add` sets |
 | `--keep-lock` | keep `uv.lock` (uv will then prefer the old versions!) |
+| `--keep-backups N` | how many past backups to keep, oldest deleted first (default: 5, 0 keeps all) |
 | `--no-groups` | ignore optional-dependencies and dependency-groups |
 | `--drop-extras` | shrink `fastapi[standard]` down to `fastapi` |
 | `--drop-markers` | drop environment markers |

@@ -32,12 +32,14 @@ from __future__ import annotations
 import argparse
 import contextlib
 import os
+import platform
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import tomllib
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import NoReturn
@@ -49,12 +51,14 @@ from . import __version__
 try:  # bevorzugt der offizielle PEP-508-Parser
     from packaging.requirements import InvalidRequirement, Requirement
 except ModuleNotFoundError:  # Fallback, damit das Skript auch nackt laeuft
-    Requirement = None  # type: ignore[assignment]
-    InvalidRequirement = ValueError  # type: ignore[assignment,misc]
+    Requirement = None
+    InvalidRequirement = ValueError  # ty: ignore[invalid-assignment]
 
 _SPEC_RE = re.compile(r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?P<extras>\[[^\]]*\])?")
 
 C_OK, C_WARN, C_ERR, C_DIM, C_OFF = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
+
+_quiet = False
 
 
 def _color_enabled(stream) -> bool:
@@ -63,7 +67,10 @@ def _color_enabled(stream) -> bool:
 
 def say(msg: str, color: str = "") -> None:
     # Fehler/Warnungen auf stderr: sonst verschwinden sie beim Umleiten von
-    # stdout (z. B. 'uv-refresh --dry-run > log.txt') spurlos.
+    # stdout (z. B. 'uv-refresh --dry-run > log.txt') spurlos. --quiet
+    # unterdrueckt nur den Status-Output, nie Warnungen/Fehler.
+    if _quiet and color not in (C_WARN, C_ERR):
+        return
     stream = sys.stderr if color in (C_WARN, C_ERR) else sys.stdout
     text = f"{color}{msg}{C_OFF}" if color and _color_enabled(stream) else msg
     print(text, file=stream)
@@ -164,6 +171,50 @@ def resolve_groups(raw_groups: dict, keep_extras: bool, keep_markers: bool) -> d
     return {grp: specs_from(expand(grp), keep_extras, keep_markers) for grp in raw_groups}
 
 
+def restrict_to_owner(path: Path) -> None:
+    """Keep other local accounts from reading a backup that may hold credentials
+    (see ensure_backup_ignored -- direct references like 'pkg @ git+https://user:token@...'
+    are copied into the backup unchanged).
+
+    os.chmod cannot express owner/group/other bits on Windows -- it only flips
+    the read-only attribute -- so 0o700 there would silently do nothing. Use
+    icacls instead, and warn (rather than stay silent) if even that fails.
+    """
+    if platform.system() != "Windows":
+        try:
+            os.chmod(path, 0o700)
+        except OSError as e:
+            say(f"  could not restrict backup permissions: {e}", C_WARN)
+        return
+    result = subprocess.run(
+        ["icacls", str(path), "/inheritance:r", "/grant:r",
+         f"{os.environ.get('USERNAME', '')}:(OI)(CI)F"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        say(f"  could not restrict backup permissions ({path} may be readable "
+            "by other local accounts; it may contain credentials)", C_WARN)
+
+
+def prune_backups(root: Path, keep: int) -> None:
+    """Removes the oldest backups beyond 'keep' (timestamp names sort chronologically).
+
+    keep <= 0 disables pruning -- backups accumulate forever otherwise, each one
+    a place credentials from a direct reference could still be sitting.
+    """
+    if keep <= 0:
+        return
+    base = root / ".uv-refresh-backup"
+    if not base.is_dir():
+        return
+    stamps = sorted(p for p in base.iterdir() if p.is_dir())
+    for old in stamps[:-keep]:
+        try:
+            shutil.rmtree(old)
+        except OSError as e:
+            say(f"  could not remove old backup {old}: {e}", C_WARN)
+
+
 def ensure_backup_ignored(root: Path) -> None:
     """Traegt '.uv-refresh-backup/' in die .gitignore ein, falls root ein Git-Repo ist.
 
@@ -262,42 +313,24 @@ def merge_dependencies(original_text: str, new_deps: list[str],
     return tomlkit.dumps(doc)
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(prog="uv-refresh", description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    p.add_argument("--path", default=".", help="project directory (default: current)")
-    p.add_argument("--dry-run", action="store_true", help="only show what would happen, change nothing")
-    p.add_argument("--yes", "-y", action="store_true", help="run without asking for confirmation")
-    p.add_argument("--verbose", "-v", action="store_true",
-                   help="print the full new pyproject.toml at the end")
-    p.add_argument("--timeout", type=float, default=300.0,
-                   help="timeout in seconds per uv call (default: 300)")
-    p.add_argument("--keep-lock", action="store_true",
-                   help="keep uv.lock (uv will then prefer the old versions!)")
-    p.add_argument("--no-groups", action="store_true",
-                   help="don't carry over optional-dependencies and dependency-groups")
-    p.add_argument("--drop-extras", action="store_true",
-                   help="drop extras: fastapi[standard] becomes fastapi (rarely useful!)")
-    p.add_argument("--drop-markers", action="store_true",
-                   help="drop environment markers, e.g. ; sys_platform == 'win32'")
-    bounds_group = p.add_mutually_exclusive_group()
-    bounds_group.add_argument("--raw", action="store_true",
-                   help="add package names with no version bound at all (uv add --raw)")
-    bounds_group.add_argument("--bounds", choices=["lower", "major", "minor", "exact"],
-                   help="kind of version bound uv add sets (uv preview feature)")
-    args = p.parse_args()
+@dataclass
+class ProjectSpecs:
+    """Everything pulled out of the original pyproject.toml that's needed to
+    rebuild it: identity for 'uv init', and version-stripped deps for 'uv add'."""
 
-    root = Path(args.path).resolve()
-    pyproject = root / "pyproject.toml"
-    lock = root / "uv.lock"
+    name: str | None
+    requires_python: str | None
+    description: str | None
+    main_deps: list[str]
+    extras: dict[str, list[str]]
+    groups: dict[str, list[str]]
+    had_groups: bool  # optional-dependencies/dependency-groups existed in the original,
+                       # independent of --no-groups -- used for the removal warning below
 
-    if not shutil.which("uv"):
-        die("uv is not on PATH.")
-    if not pyproject.is_file():
-        die(f"No pyproject.toml in {root}")
 
-    # ---- 1. lesen ---------------------------------------------------------
+def load_project_specs(pyproject: Path, args: argparse.Namespace) -> tuple[str, ProjectSpecs]:
+    """Reads pyproject.toml and extracts what 'uv init'/'uv add' need to
+    re-resolve every dependency. Exits via die() on anything unusable."""
     try:
         original_text = pyproject.read_text(encoding="utf-8")
     except UnicodeDecodeError as e:
@@ -311,11 +344,10 @@ def main() -> int:
     if not project:
         die("No [project] section found. Is this a uv/PEP 621 project?")
 
-    name = project.get("name")
-    requires_python = project.get("requires-python")
-    description = project.get("description")
     keep_extras, keep_markers = not args.drop_extras, not args.drop_markers
     main_deps = specs_from(project.get("dependencies", []), keep_extras, keep_markers)
+
+    had_groups = bool(project.get("optional-dependencies") or data.get("dependency-groups"))
 
     extras: dict[str, list[str]] = {}
     groups: dict[str, list[str]] = {}
@@ -332,11 +364,148 @@ def main() -> int:
     if not main_deps and not extras and not groups:
         die("No dependencies found. Nothing to do.")
 
-    say(f"\nProject: {name or '(no name)'}   [{root}]", C_OK)
-    say(f"  dependencies      : {', '.join(main_deps) or '-'}")
-    for g, n in extras.items():
+    return original_text, ProjectSpecs(
+        name=project.get("name"),
+        requires_python=project.get("requires-python"),
+        description=project.get("description"),
+        main_deps=main_deps,
+        extras=extras,
+        groups=groups,
+        had_groups=had_groups,
+    )
+
+
+def build_and_swap(root: Path, pyproject: Path, lock: Path, backup: Path,
+                    original_text: str, specs: ProjectSpecs, args: argparse.Namespace) -> None:
+    """Runs steps 2-6: backup, 'uv init' + 'uv add' in a temp directory, merge
+    the freshly resolved dependencies into a copy of the ORIGINAL
+    pyproject.toml, then atomically swap it into place.
+
+    pyproject.toml/uv.lock are only ever touched by the final atomic swap, so
+    if this raises (including on KeyboardInterrupt), they are guaranteed
+    unchanged -- 'backup' is kept regardless, as an extra safety net.
+    """
+    build_ctx = (tempfile.TemporaryDirectory(dir=root, prefix=".uv-refresh-tmp-")
+                 if not args.dry_run else contextlib.nullcontext(root))
+
+    if not args.dry_run:
+        ensure_backup_ignored(root)
+        backup.mkdir(parents=True, exist_ok=True)
+        restrict_to_owner(backup)
+        shutil.copy2(pyproject, backup / "pyproject.toml")
+        if lock.is_file():
+            shutil.copy2(lock, backup / "uv.lock")
+        prune_backups(root, args.keep_backups)
+
+    with build_ctx as build_dir_raw:
+        build_dir = Path(build_dir_raw)
+        if not args.dry_run and args.keep_lock and lock.is_file():
+            shutil.copy2(lock, build_dir / "uv.lock")
+
+        # ---- 3. uv init -----------------------------------------------
+        init = build_init_cmd(specs.name, specs.requires_python, specs.description)
+        try:
+            run(init, build_dir, args.dry_run, args.timeout)
+        except RuntimeError:
+            if not any(f.startswith("--python=") for f in init):
+                raise
+            say("  uv init with --python failed, retrying without it", C_WARN)
+            run([f for f in init if not f.startswith("--python=")],
+                build_dir, args.dry_run, args.timeout)
+
+        # ---- 4. uv add --------------------------------------------------
+        flags: list[str] = []
+        if args.raw:
+            flags.append("--raw")
+        if args.bounds:
+            flags += ["--bounds", args.bounds]
+
+        if specs.main_deps:
+            run(["uv", "add", *flags, *specs.main_deps], build_dir, args.dry_run, args.timeout)
+        for grp, deps in specs.extras.items():
+            if deps:
+                run(["uv", "add", "--optional", grp, *flags, *deps],
+                    build_dir, args.dry_run, args.timeout)
+        for grp, deps in specs.groups.items():
+            if deps:
+                run(["uv", "add", "--group", grp, *flags, *deps],
+                    build_dir, args.dry_run, args.timeout)
+
+        # ---- 5. Dependencies in die ORIGINALE pyproject.toml einmergen ----
+        if not args.dry_run:
+            built = tomllib.loads((build_dir / "pyproject.toml").read_text(encoding="utf-8"))
+            built_project = built.get("project", {})
+            merged = merge_dependencies(
+                original_text,
+                built_project.get("dependencies", []),
+                built_project.get("optional-dependencies", {}),
+                built.get("dependency-groups", {}),
+            )
+            (build_dir / "pyproject.toml").write_text(merged, encoding="utf-8")
+
+        # ---- 6. atomarer Tausch -------------------------------------------
+        # root blieb bis hierher unveraendert: schlaegt oben etwas fehl
+        # (auch per Ctrl+C), gibt es nichts zurueckzuholen.
+        if not args.dry_run:
+            os.replace(build_dir / "pyproject.toml", pyproject)
+            new_lock = build_dir / "uv.lock"
+            if new_lock.is_file():
+                os.replace(new_lock, lock)
+        else:
+            say("  $ (pyproject.toml/uv.lock would now be atomically replaced)", C_DIM)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="uv-refresh", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    p.add_argument("--path", default=".", help="project directory (default: current)")
+    p.add_argument("--dry-run", action="store_true", help="only show what would happen, change nothing")
+    p.add_argument("--yes", "-y", action="store_true", help="run without asking for confirmation")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="print the full new pyproject.toml at the end")
+    p.add_argument("--quiet", "-q", action="store_true",
+                   help="only print warnings/errors, no status output")
+    p.add_argument("--timeout", type=float, default=300.0,
+                   help="timeout in seconds per uv call (default: 300)")
+    p.add_argument("--keep-lock", action="store_true",
+                   help="keep uv.lock (uv will then prefer the old versions!)")
+    p.add_argument("--keep-backups", type=int, default=5, metavar="N",
+                   help="how many past backups to keep, oldest deleted first "
+                        "(default: 5, 0 keeps all)")
+    p.add_argument("--no-groups", action="store_true",
+                   help="don't carry over optional-dependencies and dependency-groups")
+    p.add_argument("--drop-extras", action="store_true",
+                   help="drop extras: fastapi[standard] becomes fastapi (rarely useful!)")
+    p.add_argument("--drop-markers", action="store_true",
+                   help="drop environment markers, e.g. ; sys_platform == 'win32'")
+    bounds_group = p.add_mutually_exclusive_group()
+    bounds_group.add_argument("--raw", action="store_true",
+                   help="add package names with no version bound at all (uv add --raw)")
+    bounds_group.add_argument("--bounds", choices=["lower", "major", "minor", "exact"],
+                   help="kind of version bound uv add sets (uv preview feature)")
+    args = p.parse_args()
+
+    global _quiet
+    _quiet = args.quiet
+
+    root = Path(args.path).resolve()
+    pyproject = root / "pyproject.toml"
+    lock = root / "uv.lock"
+
+    if not shutil.which("uv"):
+        die("uv is not on PATH.")
+    if not pyproject.is_file():
+        die(f"No pyproject.toml in {root}")
+
+    # ---- 1. lesen ---------------------------------------------------------
+    original_text, specs = load_project_specs(pyproject, args)
+
+    say(f"\nProject: {specs.name or '(no name)'}   [{root}]", C_OK)
+    say(f"  dependencies      : {', '.join(specs.main_deps) or '-'}")
+    for g, n in specs.extras.items():
         say(f"  optional [{g}]    : {', '.join(n)}")
-    for g, n in groups.items():
+    for g, n in specs.groups.items():
         say(f"  group [{g}]       : {', '.join(n)}")
 
     # ---- Was sich aendert ---------------------------------------------------
@@ -344,7 +513,7 @@ def main() -> int:
     # alles andere (description, readme, license, authors, keywords,
     # [project.urls], [project.scripts], [build-system], [tool.*], ...)
     # bleibt unangetastet -- siehe merge_dependencies().
-    if args.no_groups and (project.get("optional-dependencies") or data.get("dependency-groups")):
+    if args.no_groups and specs.had_groups:
         say("\n--no-groups: existing optional-dependencies/dependency-groups "
             "will be removed from the new pyproject.toml.", C_WARN)
 
@@ -355,7 +524,7 @@ def main() -> int:
             answer = input("\nRebuild pyproject.toml now? [y/N] ").strip().lower()
         except EOFError:
             die("No input possible (no terminal). Use --yes to run without confirmation.")
-        if answer != "y":
+        if answer not in ("y", "yes"):
             say("Aborted.", C_DIM)
             return 1
 
@@ -366,78 +535,8 @@ def main() -> int:
     say("Building in a temp directory; your real pyproject.toml/uv.lock "
         "stay untouched until the final step.", C_DIM)
 
-    build_ctx = (tempfile.TemporaryDirectory(dir=root, prefix=".uv-refresh-tmp-")
-                 if not args.dry_run else contextlib.nullcontext(root))
-
     try:
-        if not args.dry_run:
-            ensure_backup_ignored(root)
-            backup.mkdir(parents=True, exist_ok=True)
-            try:
-                os.chmod(backup, 0o700)
-            except OSError:
-                pass
-            shutil.copy2(pyproject, backup / "pyproject.toml")
-            if lock.is_file():
-                shutil.copy2(lock, backup / "uv.lock")
-
-        with build_ctx as build_dir_raw:
-            build_dir = Path(build_dir_raw)
-            if not args.dry_run and args.keep_lock and lock.is_file():
-                shutil.copy2(lock, build_dir / "uv.lock")
-
-            # ---- 3. uv init -----------------------------------------------
-            init = build_init_cmd(name, requires_python, description)
-            try:
-                run(init, build_dir, args.dry_run, args.timeout)
-            except RuntimeError:
-                if not any(f.startswith("--python=") for f in init):
-                    raise
-                say("  uv init with --python failed, retrying without it", C_WARN)
-                run([f for f in init if not f.startswith("--python=")],
-                    build_dir, args.dry_run, args.timeout)
-
-            # ---- 4. uv add --------------------------------------------------
-            flags: list[str] = []
-            if args.raw:
-                flags.append("--raw")
-            if args.bounds:
-                flags += ["--bounds", args.bounds]
-
-            if main_deps:
-                run(["uv", "add", *flags, *main_deps], build_dir, args.dry_run, args.timeout)
-            for grp, deps in extras.items():
-                if deps:
-                    run(["uv", "add", "--optional", grp, *flags, *deps],
-                        build_dir, args.dry_run, args.timeout)
-            for grp, deps in groups.items():
-                if deps:
-                    run(["uv", "add", "--group", grp, *flags, *deps],
-                        build_dir, args.dry_run, args.timeout)
-
-            # ---- 5. Dependencies in die ORIGINALE pyproject.toml einmergen ----
-            if not args.dry_run:
-                built = tomllib.loads((build_dir / "pyproject.toml").read_text(encoding="utf-8"))
-                built_project = built.get("project", {})
-                merged = merge_dependencies(
-                    original_text,
-                    built_project.get("dependencies", []),
-                    built_project.get("optional-dependencies", {}),
-                    built.get("dependency-groups", {}),
-                )
-                (build_dir / "pyproject.toml").write_text(merged, encoding="utf-8")
-
-            # ---- 6. atomarer Tausch -------------------------------------------
-            # root blieb bis hierher unveraendert: schlaegt oben etwas fehl
-            # (auch per Ctrl+C), gibt es nichts zurueckzuholen.
-            if not args.dry_run:
-                os.replace(build_dir / "pyproject.toml", pyproject)
-                new_lock = build_dir / "uv.lock"
-                if new_lock.is_file():
-                    os.replace(new_lock, lock)
-            else:
-                say("  $ (pyproject.toml/uv.lock would now be atomically replaced)", C_DIM)
-
+        build_and_swap(root, pyproject, lock, backup, original_text, specs, args)
     except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 -- Notbremse: bei
         # JEDEM Fehler (uv, Dateisystem, Interrupt, ...) klar melden. Der Aufbau
         # geschah in einem Temp-Verzeichnis, root ist daher normalerweise

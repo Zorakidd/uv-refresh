@@ -1,3 +1,5 @@
+import shutil
+import subprocess
 import sys
 import tomllib
 
@@ -200,3 +202,224 @@ def test_main_dry_run_leaves_project_untouched(tmp_path, monkeypatch):
     assert pyproject.read_text(encoding="utf-8") == original
     assert not (tmp_path / ".uv-refresh-backup").exists()
     assert not any(tmp_path.glob(".uv-refresh-tmp-*"))
+
+
+def _stub_run_writing(resolved_pyproject_text):
+    """Fakes cli.run(): 'uv init' seeds a minimal pyproject.toml in the build
+    dir, 'uv add' overwrites it with the given already-resolved text -- close
+    enough to real uv output for build_and_swap()'s merge step to work on."""
+
+    def fake_run(cmd, cwd, dry, timeout=None):
+        if cmd[:2] == ["uv", "init"]:
+            (cwd / "pyproject.toml").write_text(
+                '[project]\nname = "demo"\nversion = "0.0.0"\n', encoding="utf-8")
+        elif cmd[:2] == ["uv", "add"]:
+            (cwd / "pyproject.toml").write_text(resolved_pyproject_text, encoding="utf-8")
+
+    return fake_run
+
+
+def test_main_success_swaps_pyproject_and_lock(tmp_path, monkeypatch):
+    # regression test: the module docstring promises pyproject.toml is only
+    # ever touched by the final atomic swap -- this is the one path
+    # (main() outside --dry-run) that actually exercises that swap, and until
+    # now nothing did.
+    pyproject = tmp_path / "pyproject.toml"
+    original = '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n'
+    pyproject.write_text(original, encoding="utf-8")
+
+    monkeypatch.setattr(cli, "run", _stub_run_writing(
+        '[project]\nname = "demo"\nversion = "0.0.0"\n'
+        'dependencies = ["requests==2.31.0"]\n'
+    ))
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes"])
+
+    assert cli.main() == 0
+
+    result = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    assert result["project"]["dependencies"] == ["requests==2.31.0"]
+    assert result["project"]["version"] == "1.0.0"  # untouched fields survive the merge
+
+    backups = list((tmp_path / ".uv-refresh-backup").iterdir())
+    assert len(backups) == 1
+    assert (backups[0] / "pyproject.toml").read_text(encoding="utf-8") == original
+    assert not any(tmp_path.glob(".uv-refresh-tmp-*"))  # temp build dir cleaned up
+
+
+def test_main_failure_leaves_pyproject_untouched(tmp_path, monkeypatch):
+    # regression test: the flip side of the guarantee above -- a failure
+    # partway through (here: 'uv add' itself) must never reach the real file.
+    pyproject = tmp_path / "pyproject.toml"
+    original = '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n'
+    pyproject.write_text(original, encoding="utf-8")
+
+    def failing_run(cmd, cwd, dry, timeout=None):
+        if cmd[:2] == ["uv", "init"]:
+            (cwd / "pyproject.toml").write_text(
+                '[project]\nname = "demo"\nversion = "0.0.0"\n', encoding="utf-8")
+        else:
+            raise RuntimeError("Command failed: uv add (simulated network error)")
+
+    monkeypatch.setattr(cli, "run", failing_run)
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes"])
+
+    assert cli.main() == 1
+    assert pyproject.read_text(encoding="utf-8") == original
+    assert list((tmp_path / ".uv-refresh-backup").iterdir())  # backup kept as the recovery net
+    assert not any(tmp_path.glob(".uv-refresh-tmp-*"))
+
+
+def test_main_confirmation_accepts_yes(tmp_path, monkeypatch):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path)])
+    monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
+    started = []
+    monkeypatch.setattr(cli, "build_and_swap", lambda *a, **k: started.append(True))
+
+    assert cli.main() == 0
+    assert started == [True]
+
+
+def test_main_confirmation_rejects_anything_else(tmp_path, monkeypatch):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path)])
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+    started = []
+    monkeypatch.setattr(cli, "build_and_swap", lambda *a, **k: started.append(True))
+
+    assert cli.main() == 1
+    assert started == []
+
+
+def test_prune_backups_keeps_newest_n(tmp_path):
+    base = tmp_path / ".uv-refresh-backup"
+    stamps = ["20260101-000000", "20260102-000000", "20260103-000000", "20260104-000000"]
+    for s in stamps:
+        (base / s).mkdir(parents=True)
+
+    cli.prune_backups(tmp_path, keep=2)
+
+    assert sorted(p.name for p in base.iterdir()) == stamps[-2:]
+
+
+def test_prune_backups_keep_zero_keeps_everything(tmp_path):
+    base = tmp_path / ".uv-refresh-backup"
+    for s in ["20260101-000000", "20260102-000000"]:
+        (base / s).mkdir(parents=True)
+
+    cli.prune_backups(tmp_path, keep=0)
+
+    assert len(list(base.iterdir())) == 2
+
+
+def test_prune_backups_missing_dir_is_a_no_op(tmp_path):
+    cli.prune_backups(tmp_path, keep=5)  # must not raise
+
+
+def test_prune_backups_warns_instead_of_swallowing_failure(tmp_path, monkeypatch, capsys):
+    # regression test: an unremovable backup (locked file, permissions, ...)
+    # must be reported, not silently dropped -- and must not stop the other
+    # old backups from still being pruned.
+    base = tmp_path / ".uv-refresh-backup"
+    stamps = ["20260101-000000", "20260102-000000", "20260103-000000"]
+    for s in stamps:
+        (base / s).mkdir(parents=True)
+
+    real_rmtree = shutil.rmtree
+
+    def flaky_rmtree(path):
+        if path.name == "20260101-000000":
+            raise OSError("simulated: file in use")
+        real_rmtree(path)
+
+    monkeypatch.setattr(cli.shutil, "rmtree", flaky_rmtree)
+
+    cli.prune_backups(tmp_path, keep=1)
+
+    remaining = sorted(p.name for p in base.iterdir())
+    assert remaining == ["20260101-000000", "20260103-000000"]  # unremovable one survives
+    assert "could not remove old backup" in capsys.readouterr().err
+
+
+def test_main_success_prunes_old_backups(tmp_path, monkeypatch):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n',
+        encoding="utf-8",
+    )
+    backup_base = tmp_path / ".uv-refresh-backup"
+    for s in ["20200101-000000", "20200102-000000", "20200103-000000"]:
+        (backup_base / s).mkdir(parents=True)
+
+    monkeypatch.setattr(cli, "run", _stub_run_writing(
+        '[project]\nname = "demo"\nversion = "0.0.0"\ndependencies = ["requests==2.31.0"]\n'
+    ))
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv",
+                         ["uv-refresh", "--path", str(tmp_path), "--yes", "--keep-backups", "2"])
+
+    assert cli.main() == 0
+    assert len(list(backup_base.iterdir())) == 2
+
+
+def test_restrict_to_owner_uses_chmod_on_posix(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli.platform, "system", lambda: "Linux")
+    calls = []
+    monkeypatch.setattr(cli.os, "chmod", lambda path, mode: calls.append((path, mode)))
+
+    cli.restrict_to_owner(tmp_path)
+
+    assert calls == [(tmp_path, 0o700)]
+
+
+def test_restrict_to_owner_uses_icacls_on_windows(tmp_path, monkeypatch, capsys):
+    # regression test: os.chmod cannot express owner-only access on Windows
+    # (it only toggles the read-only attribute) -- the backup may contain
+    # credentials from direct-reference dependencies, so this must not
+    # silently no-op there the way the original os.chmod(0o700) call did.
+    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    cli.restrict_to_owner(tmp_path)
+
+    assert calls and calls[0][0] == "icacls"
+    assert "could not restrict" not in capsys.readouterr().err
+
+
+def test_restrict_to_owner_warns_when_icacls_fails(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(cli.subprocess, "run",
+                         lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1))
+
+    cli.restrict_to_owner(tmp_path)
+
+    assert "could not restrict backup permissions" in capsys.readouterr().err
+
+
+def test_quiet_suppresses_status_but_not_warnings(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_quiet", True)
+
+    cli.say("status message")
+    cli.say("warning message", cli.C_WARN)
+
+    out, err = capsys.readouterr()
+    assert "status message" not in out
+    assert "warning message" in err
