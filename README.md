@@ -55,6 +55,7 @@ Or straight from the repo, e.g. to try an unreleased version:
 | `--keep-lock` | keep `uv.lock` (uv will then prefer the old versions!) |
 | `--keep-backups N` | how many past backups to keep, oldest deleted first (default: 5, 0 keeps all) |
 | `--no-groups` | ignore optional-dependencies and dependency-groups |
+| `--full` | re-pin `.python-version` to the newest installed Python |
 | `--drop-extras` | shrink `fastapi[standard]` down to `fastapi` |
 | `--drop-markers` | drop environment markers |
 | `--version` | show the uv-refresh version |
@@ -73,3 +74,10 @@ One exception: with `--no-groups`, any existing
 `optional-dependencies`/`dependency-groups` are intentionally removed (the
 tool warns beforehand). Individual entries that can't be interpreted as a
 PEP 508 string are skipped and reported per entry.
+
+`--full` runs before any of that: it re-pins `.python-version` via
+`uv python pin` to the newest *already installed* Python it can find
+(`uv python list --only-installed`) -- it never triggers a download on its
+own. `uv python pin` refuses to write anything if the target version
+doesn't satisfy `requires-python`, so a failure here leaves an existing
+`.python-version` untouched.

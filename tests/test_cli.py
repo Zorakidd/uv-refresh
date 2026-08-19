@@ -414,6 +414,92 @@ def test_restrict_to_owner_warns_when_icacls_fails(tmp_path, monkeypatch, capsys
     assert "could not restrict backup permissions" in capsys.readouterr().err
 
 
+def test_latest_installed_python_picks_first_entry(monkeypatch):
+    payload = '[{"version": "3.13.5"}, {"version": "3.11.14"}]'
+    monkeypatch.setattr(
+        cli.subprocess, "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout=payload),
+    )
+    assert cli.latest_installed_python() == "3.13.5"
+
+
+def test_latest_installed_python_returns_none_on_failure(monkeypatch):
+    monkeypatch.setattr(
+        cli.subprocess, "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1, stdout=""),
+    )
+    assert cli.latest_installed_python() is None
+
+
+def test_latest_installed_python_returns_none_when_nothing_installed(monkeypatch):
+    monkeypatch.setattr(
+        cli.subprocess, "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="[]"),
+    )
+    assert cli.latest_installed_python() is None
+
+
+def test_refresh_python_version_pins_the_newest_version(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "latest_installed_python", lambda: "3.13.5")
+    calls = []
+    monkeypatch.setattr(cli, "run", lambda cmd, cwd, dry, timeout=None: calls.append((cmd, cwd, dry)))
+
+    cli.refresh_python_version(tmp_path, dry=False)
+
+    assert calls == [(["uv", "python", "pin", "3.13.5"], tmp_path, False)]
+
+
+def test_refresh_python_version_warns_when_nothing_installed(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "latest_installed_python", lambda: None)
+    calls = []
+    monkeypatch.setattr(cli, "run", lambda *a, **k: calls.append(a))
+
+    cli.refresh_python_version(tmp_path, dry=False)
+
+    assert calls == []
+    assert "no installed Python found" in capsys.readouterr().err
+
+
+def test_main_full_stops_before_backup_on_pin_failure(tmp_path, monkeypatch):
+    # a failure while re-pinning .python-version must never reach the
+    # pyproject.toml/uv.lock backup+build steps.
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes", "--full"])
+
+    def failing_refresh(root, dry):
+        raise RuntimeError("Command failed: uv python pin 3.14.0")
+
+    monkeypatch.setattr(cli, "refresh_python_version", failing_refresh)
+    started = []
+    monkeypatch.setattr(cli, "build_and_swap", lambda *a, **k: started.append(True))
+
+    assert cli.main() == 1
+    assert started == []
+    assert not (tmp_path / ".uv-refresh-backup").exists()
+
+
+def test_main_full_runs_refresh_then_build(tmp_path, monkeypatch):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes", "--full"])
+
+    order = []
+    monkeypatch.setattr(cli, "refresh_python_version", lambda root, dry: order.append("refresh"))
+    monkeypatch.setattr(cli, "build_and_swap", lambda *a, **k: order.append("build"))
+
+    assert cli.main() == 0
+    assert order == ["refresh", "build"]
+
+
 def test_quiet_suppresses_status_but_not_warnings(capsys, monkeypatch):
     monkeypatch.setattr(cli, "_quiet", True)
 

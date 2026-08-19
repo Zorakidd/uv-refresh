@@ -25,12 +25,14 @@ Usage:
   uv-refresh --dry-run       # just show what would happen, touch nothing
   uv-refresh --raw           # add packages with no version bound at all
   uv-refresh --path ../other # a different project directory
+  uv-refresh --full          # re-pin .python-version to the newest installed Python
 """
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import platform
 import re
@@ -267,6 +269,51 @@ def run(cmd: list[str], cwd: Path, dry: bool, timeout: float | None = None) -> N
         raise RuntimeError(f"Command ran longer than {timeout:.0f}s and was aborted: {' '.join(cmd)}") from e
     if result.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+
+
+def latest_installed_python() -> str | None:
+    """Newest Python version 'uv python list' can find already installed
+    (uv-managed or otherwise) -- the list comes back newest first, so the
+    first entry is it. Deliberately --only-installed: --full re-pins to
+    what's already there, it should never trigger a Python download on its
+    own just to figure out what the newest version would be.
+    """
+    result = subprocess.run(
+        ["uv", "python", "list", "--only-installed", "--output-format", "json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        installs = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return installs[0]["version"] if installs else None
+
+
+def refresh_python_version(root: Path, dry: bool) -> None:
+    """--full: drops whatever .python-version currently pins and re-pins the
+    project to the newest Python installation uv can find, instead of
+    quietly dragging along whatever version happened to be current when it
+    was last pinned.
+
+    No separate delete step: 'uv python pin' overwrites an existing pin (or
+    creates a fresh one) directly, and -- crucially -- refuses to write
+    anything at all if the target version doesn't satisfy requires-python.
+    Deleting the file first would just create a window where a failed pin
+    leaves the project with no .python-version instead of the old one.
+
+    Runs before the backup/build steps in main(), so a failure here never
+    touches pyproject.toml/uv.lock at all.
+    """
+    latest = latest_installed_python()
+    if latest is None:
+        say("  --full: no installed Python found (uv python list), leaving .python-version unset", C_WARN)
+        return
+
+    run(["uv", "python", "pin", latest], root, dry)
 
 
 def _toml_array(values: list[str]):
@@ -506,6 +553,11 @@ def main() -> int:
         help="don't carry over optional-dependencies and dependency-groups",
     )
     p.add_argument(
+        "--full",
+        action="store_true",
+        help="also re-pin .python-version to the newest installed Python",
+    )
+    p.add_argument(
         "--drop-extras",
         action="store_true",
         help="drop extras: fastapi[standard] becomes fastapi (rarely useful!)",
@@ -558,15 +610,30 @@ def main() -> int:
             C_WARN,
         )
 
+    if args.full:
+        say("\n--full: .python-version will be re-pinned to the newest installed Python.", C_DIM)
+
     if args.dry_run:
         say("\n--dry-run: from here on, this would happen:", C_DIM)
     elif not args.yes:
+        prompt = "Rebuild pyproject.toml (and re-pin Python) now? [Y/N] " if args.full \
+            else "Rebuild pyproject.toml now? [Y/N] "
         try:
-            answer = input("\nRebuild pyproject.toml now? [Y/N] ").strip().lower()
+            answer = input(f"\n{prompt}").strip().lower()
         except EOFError:
             die("No input possible (no terminal). Use --yes to run without confirmation.")
         if answer not in ("y", "yes"):
             say("Aborted.", C_DIM)
+            return 1
+
+    if args.full:
+        try:
+            refresh_python_version(root, args.dry_run)
+        except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 -- siehe build_and_swap:
+            # jeder Fehler hier muss klar gemeldet werden. Passiert vor jeder
+            # Backup-/Build-Aktion unten, pyproject.toml/uv.lock sind also so
+            # oder so unveraendert.
+            say(f"\n{e}", C_ERR)
             return 1
 
     # ---- 2. Backup --------------------------------------------------------
