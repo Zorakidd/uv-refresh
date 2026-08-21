@@ -124,7 +124,7 @@ wheels = [
 
 [[package]]
 name = "uv-refresh"
-version = "0.1.11"
+version = "0.1.12"
 source = { editable = "." }
 dependencies = [
     { name = "packaging" },
