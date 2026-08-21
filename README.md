@@ -55,7 +55,7 @@ Or straight from the repo, e.g. to try an unreleased version:
 | `--keep-lock` | keep `uv.lock` (uv will then prefer the old versions!) |
 | `--keep-backups N` | how many past backups to keep, oldest deleted first (default: 5, 0 keeps all) |
 | `--no-groups` | ignore optional-dependencies and dependency-groups |
-| `--full` | re-pin `.python-version` to the newest installed Python |
+| `--full` | also bump `requires-python` and re-pin `.python-version` to the newest installed Python |
 | `--drop-extras` | shrink `fastapi[standard]` down to `fastapi` |
 | `--drop-markers` | drop environment markers |
 | `--version` | show the uv-refresh version |
@@ -75,9 +75,17 @@ One exception: with `--no-groups`, any existing
 tool warns beforehand). Individual entries that can't be interpreted as a
 PEP 508 string are skipped and reported per entry.
 
-`--full` runs before any of that: it re-pins `.python-version` via
-`uv python pin` to the newest *already installed* Python it can find
-(`uv python list --only-installed`) -- it never triggers a download on its
-own. `uv python pin` refuses to write anything if the target version
-doesn't satisfy `requires-python`, so a failure here leaves an existing
-`.python-version` untouched.
+`--full` additionally bumps `requires-python` to the newest *already
+installed* Python it can find (`uv python list --only-installed` -- it
+never triggers a download on its own), e.g. `>=3.11` becomes `>=3.13`. That
+bump is part of the same atomic pyproject.toml rebuild as the dependency
+refresh, so it's covered by the same backup/all-or-nothing guarantee.
+
+Only once that rebuild has landed does `--full` re-pin `.python-version` via
+`uv python pin` to that same version. This runs *after* the rebuild on
+purpose: `uv python pin` refuses to write anything if the target version
+doesn't satisfy `requires-python`, and by pinning after the bump above, it's
+checked against the *new* `requires-python` -- so jumping to a newer Python
+than the project previously allowed still works. If the pin itself then
+fails, the dependency refresh and `requires-python` bump are kept regardless
+(they already succeeded); only `.python-version` is left as it was.

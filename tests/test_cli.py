@@ -135,6 +135,12 @@ def test_merge_dependencies_preserves_everything_else():
     assert result["tool"]["ruff"]["target-version"] == "py311"
 
 
+def test_merge_dependencies_bumps_requires_python_when_given():
+    merged = cli.merge_dependencies(_ORIGINAL_PYPROJECT, ["click>=8.1.0"], {}, {}, ">=3.14")
+    result = tomllib.loads(merged)
+    assert result["project"]["requires-python"] == ">=3.14"
+
+
 def test_merge_dependencies_adds_groups():
     original = '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = []\n'
     merged = cli.merge_dependencies(
@@ -245,6 +251,46 @@ def test_main_success_swaps_pyproject_and_lock(tmp_path, monkeypatch):
     assert len(backups) == 1
     assert (backups[0] / "pyproject.toml").read_text(encoding="utf-8") == original
     assert not any(tmp_path.glob(".uv-refresh-tmp-*"))  # temp build dir cleaned up
+
+
+def test_main_full_bumps_requires_python_and_pins_python(tmp_path, monkeypatch):
+    # end-to-end through main(): --full should (a) tell 'uv init' to target
+    # the newest installed Python, (b) end up with that same floor written to
+    # requires-python in the real pyproject.toml, and (c) pin .python-version
+    # to it once the swap has landed.
+    pyproject = tmp_path / "pyproject.toml"
+    original = (
+        '[project]\nname = "demo"\nversion = "1.0.0"\nrequires-python = ">=3.9"\n'
+        'dependencies = ["requests>=2.0"]\n'
+    )
+    pyproject.write_text(original, encoding="utf-8")
+
+    all_cmds = []
+
+    def fake_run(cmd, cwd, dry, timeout=None):
+        all_cmds.append(cmd)
+        if cmd[:2] == ["uv", "init"]:
+            (cwd / "pyproject.toml").write_text(
+                '[project]\nname = "demo"\nversion = "0.0.0"\n', encoding="utf-8")
+        elif cmd[:2] == ["uv", "add"]:
+            (cwd / "pyproject.toml").write_text(
+                '[project]\nname = "demo"\nversion = "0.0.0"\n'
+                'dependencies = ["requests==2.31.0"]\n', encoding="utf-8")
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    monkeypatch.setattr(cli, "latest_installed_python", lambda: "3.14.0")
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes", "--full"])
+
+    assert cli.main() == 0
+
+    init_cmd = next(c for c in all_cmds if c[:2] == ["uv", "init"])
+    assert "--python=>=3.14" in init_cmd
+    assert ["uv", "python", "pin", "3.14.0"] in all_cmds
+
+    result = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    assert result["project"]["requires-python"] == ">=3.14"
+    assert result["project"]["dependencies"] == ["requests==2.31.0"]
 
 
 def test_main_failure_leaves_pyproject_untouched(tmp_path, monkeypatch):
@@ -439,30 +485,48 @@ def test_latest_installed_python_returns_none_when_nothing_installed(monkeypatch
     assert cli.latest_installed_python() is None
 
 
-def test_refresh_python_version_pins_the_newest_version(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "latest_installed_python", lambda: "3.13.5")
+def test_requires_python_floor_truncates_to_major_minor():
+    assert cli.requires_python_floor("3.13.5") == ">=3.13"
+
+
+def test_refresh_python_version_pins_the_given_version(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(cli, "run", lambda cmd, cwd, dry, timeout=None: calls.append((cmd, cwd, dry)))
 
-    cli.refresh_python_version(tmp_path, dry=False)
+    cli.refresh_python_version(tmp_path, dry=False, version="3.13.5")
 
     assert calls == [(["uv", "python", "pin", "3.13.5"], tmp_path, False)]
 
 
-def test_refresh_python_version_warns_when_nothing_installed(tmp_path, monkeypatch, capsys):
+def test_main_full_skips_bump_and_pin_when_nothing_installed(tmp_path, monkeypatch, capsys):
+    # no installed Python found -> neither the requires-python bump nor the
+    # .python-version pin should happen; build_and_swap still runs (a plain
+    # dependency refresh), just with latest_python=None.
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes", "--full"])
     monkeypatch.setattr(cli, "latest_installed_python", lambda: None)
-    calls = []
-    monkeypatch.setattr(cli, "run", lambda *a, **k: calls.append(a))
 
-    cli.refresh_python_version(tmp_path, dry=False)
+    build_calls = []
+    monkeypatch.setattr(cli, "build_and_swap", lambda *a, **k: build_calls.append(a))
+    refresh_calls = []
+    monkeypatch.setattr(cli, "refresh_python_version", lambda *a, **k: refresh_calls.append(a))
 
-    assert calls == []
+    assert cli.main() == 0
+    assert len(build_calls) == 1
+    assert build_calls[0][-1] is None  # latest_python passed through as None
+    assert refresh_calls == []
     assert "no installed Python found" in capsys.readouterr().err
 
 
-def test_main_full_stops_before_backup_on_pin_failure(tmp_path, monkeypatch):
-    # a failure while re-pinning .python-version must never reach the
-    # pyproject.toml/uv.lock backup+build steps.
+def test_main_full_runs_build_then_pin_with_latest_version(tmp_path, monkeypatch):
+    # requires-python is bumped inside build_and_swap (same atomic rebuild as
+    # dependencies); .python-version is only re-pinned afterwards, once that
+    # rebuild has landed -- see refresh_python_version()'s docstring for why.
     pyproject = tmp_path / "pyproject.toml"
     pyproject.write_text(
         '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n',
@@ -470,34 +534,46 @@ def test_main_full_stops_before_backup_on_pin_failure(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
     monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes", "--full"])
+    monkeypatch.setattr(cli, "latest_installed_python", lambda: "3.14.0")
 
-    def failing_refresh(root, dry):
+    order = []
+    monkeypatch.setattr(
+        cli, "build_and_swap",
+        lambda root, pyproject, lock, backup, original_text, specs, args, latest_python:
+            order.append(("build", latest_python)),
+    )
+    monkeypatch.setattr(
+        cli, "refresh_python_version",
+        lambda root, dry, version: order.append(("refresh", version)),
+    )
+
+    assert cli.main() == 0
+    assert order == [("build", "3.14.0"), ("refresh", "3.14.0")]
+
+
+def test_main_full_pin_failure_after_build_reports_but_keeps_the_rebuild(tmp_path, monkeypatch):
+    # a failed .python-version pin runs AFTER the atomic pyproject.toml swap,
+    # so it must be reported but must not claim the rebuild itself failed.
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes", "--full"])
+    monkeypatch.setattr(cli, "latest_installed_python", lambda: "3.14.0")
+
+    order = []
+    monkeypatch.setattr(cli, "build_and_swap", lambda *a, **k: order.append("build"))
+
+    def failing_refresh(root, dry, version):
+        order.append("refresh")
         raise RuntimeError("Command failed: uv python pin 3.14.0")
 
     monkeypatch.setattr(cli, "refresh_python_version", failing_refresh)
-    started = []
-    monkeypatch.setattr(cli, "build_and_swap", lambda *a, **k: started.append(True))
 
     assert cli.main() == 1
-    assert started == []
-    assert not (tmp_path / ".uv-refresh-backup").exists()
-
-
-def test_main_full_runs_refresh_then_build(tmp_path, monkeypatch):
-    pyproject = tmp_path / "pyproject.toml"
-    pyproject.write_text(
-        '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n',
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
-    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes", "--full"])
-
-    order = []
-    monkeypatch.setattr(cli, "refresh_python_version", lambda root, dry: order.append("refresh"))
-    monkeypatch.setattr(cli, "build_and_swap", lambda *a, **k: order.append("build"))
-
-    assert cli.main() == 0
-    assert order == ["refresh", "build"]
+    assert order == ["build", "refresh"]
 
 
 def test_quiet_suppresses_status_but_not_warnings(capsys, monkeypatch):

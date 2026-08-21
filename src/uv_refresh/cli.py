@@ -20,12 +20,16 @@ If any step fails -- including Ctrl+C -- the real pyproject.toml was never
 touched, since the whole build happened in the temp directory. The backup
 is kept around as an extra reference regardless.
 
+--full additionally bumps requires-python to the newest installed Python as
+part of step 4 (so it's covered by the same atomic swap in step 5), then
+re-pins .python-version to match once that swap has landed.
+
 Usage:
   uv-refresh                 # in the project directory, asks for confirmation
   uv-refresh --dry-run       # just show what would happen, touch nothing
   uv-refresh --raw           # add packages with no version bound at all
   uv-refresh --path ../other # a different project directory
-  uv-refresh --full          # re-pin .python-version to the newest installed Python
+  uv-refresh --full          # bump requires-python + re-pin .python-version to the newest installed Python
 """
 
 from __future__ import annotations
@@ -293,27 +297,32 @@ def latest_installed_python() -> str | None:
     return installs[0]["version"] if installs else None
 
 
-def refresh_python_version(root: Path, dry: bool) -> None:
+def requires_python_floor(version: str) -> str:
+    """Turns an installed interpreter version like '3.13.5' into the '>=3.13'
+    floor a fresh 'uv init' would write for it -- major.minor only, no patch,
+    so --full doesn't make requires-python any stricter than a real project
+    normally would (nobody floors requires-python at an exact patch release).
+    """
+    major_minor = ".".join(version.split(".")[:2])
+    return f">={major_minor}"
+
+
+def refresh_python_version(root: Path, dry: bool, version: str) -> None:
     """--full: drops whatever .python-version currently pins and re-pins the
-    project to the newest Python installation uv can find, instead of
-    quietly dragging along whatever version happened to be current when it
-    was last pinned.
+    project to 'version' (the newest installed Python -- main() already
+    looked it up and used it to bump requires-python in the same rebuild).
 
     No separate delete step: 'uv python pin' overwrites an existing pin (or
     creates a fresh one) directly, and -- crucially -- refuses to write
     anything at all if the target version doesn't satisfy requires-python.
-    Deleting the file first would just create a window where a failed pin
-    leaves the project with no .python-version instead of the old one.
 
-    Runs before the backup/build steps in main(), so a failure here never
-    touches pyproject.toml/uv.lock at all.
+    Runs AFTER build_and_swap(), not before: requires-python is bumped as
+    part of that same atomic pyproject.toml rebuild, so requires-python
+    already allows 'version' by the time this pin runs. Pinning first (the
+    old order) would fail here whenever --full jumps to a Python newer than
+    the OLD requires-python permitted -- exactly the case --full is for.
     """
-    latest = latest_installed_python()
-    if latest is None:
-        say("  --full: no installed Python found (uv python list), leaving .python-version unset", C_WARN)
-        return
-
-    run(["uv", "python", "pin", latest], root, dry)
+    run(["uv", "python", "pin", version], root, dry)
 
 
 def _toml_array(values: list[str]):
@@ -337,6 +346,7 @@ def merge_dependencies(
     new_deps: list[str],
     new_extras: dict[str, list[str]],
     new_groups: dict[str, list[str]],
+    new_requires_python: str | None = None,
 ) -> str:
     """Schreibt frisch aufgeloeste Dependencies in eine Kopie der ORIGINALEN
     pyproject.toml, statt sie in eine von 'uv init --bare' neu angelegte
@@ -349,9 +359,17 @@ def merge_dependencies(
     nie angefasst, weil es nie geloescht wurde. tomlkit erhaelt dabei
     Formatierung und Kommentare des Originals, statt es platt neu zu
     serialisieren.
+
+    new_requires_python is the one exception to "leave everything but deps
+    alone": --full passes it (see build_and_swap) to bump requires-python
+    alongside the dependency refresh; every other caller leaves it None and
+    requires-python stays whatever the original had.
     """
     doc = tomlkit.parse(original_text)
     doc["project"]["dependencies"] = _toml_array(new_deps)
+
+    if new_requires_python:
+        doc["project"]["requires-python"] = new_requires_python
 
     if new_extras:
         doc["project"]["optional-dependencies"] = _toml_group_table(new_extras)
@@ -436,6 +454,7 @@ def build_and_swap(
     original_text: str,
     specs: ProjectSpecs,
     args: argparse.Namespace,
+    latest_python: str | None = None,
 ) -> None:
     """Runs steps 2-6: backup, 'uv init' + 'uv add' in a temp directory, merge
     the freshly resolved dependencies into a copy of the ORIGINAL
@@ -444,6 +463,12 @@ def build_and_swap(
     pyproject.toml/uv.lock are only ever touched by the final atomic swap, so
     if this raises (including on KeyboardInterrupt), they are guaranteed
     unchanged -- 'backup' is kept regardless, as an extra safety net.
+
+    latest_python is only set when --full found an installed Python (main()
+    looked it up); when set, requires-python is bumped to match it as part
+    of this same atomic rebuild, and 'uv init' below targets it too --
+    main() re-pins .python-version to it afterwards, once requires-python
+    already allows that pin.
     """
     build_ctx = (
         tempfile.TemporaryDirectory(dir=root, prefix=".uv-refresh-tmp-")
@@ -466,7 +491,9 @@ def build_and_swap(
             shutil.copy2(lock, build_dir / "uv.lock")
 
         # ---- 3. uv init -----------------------------------------------
-        init = build_init_cmd(specs.name, specs.requires_python, specs.description)
+        new_requires_python = requires_python_floor(latest_python) if latest_python else None
+        init_python = new_requires_python or specs.requires_python
+        init = build_init_cmd(specs.name, init_python, specs.description)
         try:
             run(init, build_dir, args.dry_run, args.timeout)
         except RuntimeError:
@@ -500,6 +527,7 @@ def build_and_swap(
                 built_project.get("dependencies", []),
                 built_project.get("optional-dependencies", {}),
                 built.get("dependency-groups", {}),
+                new_requires_python,
             )
             (build_dir / "pyproject.toml").write_text(merged, encoding="utf-8")
 
@@ -555,7 +583,7 @@ def main() -> int:
     p.add_argument(
         "--full",
         action="store_true",
-        help="also re-pin .python-version to the newest installed Python",
+        help="also bump requires-python and re-pin .python-version to the newest installed Python",
     )
     p.add_argument(
         "--drop-extras",
@@ -610,8 +638,26 @@ def main() -> int:
             C_WARN,
         )
 
+    # latest_python is looked up here (read-only 'uv python list') rather than
+    # inside build_and_swap(): main() needs it already for the dry-run/confirm
+    # messages below, and build_and_swap() needs that SAME value for the
+    # requires-python bump -- a second lookup there could return something
+    # different (e.g. a Python installed in between).
+    latest_python: str | None = None
     if args.full:
-        say("\n--full: .python-version will be re-pinned to the newest installed Python.", C_DIM)
+        latest_python = latest_installed_python()
+        if latest_python is None:
+            say(
+                "  --full: no installed Python found (uv python list), "
+                "leaving requires-python/.python-version unchanged",
+                C_WARN,
+            )
+        else:
+            say(
+                f"\n--full: requires-python will be bumped to {requires_python_floor(latest_python)} "
+                f"and .python-version re-pinned to {latest_python}.",
+                C_DIM,
+            )
 
     if args.dry_run:
         say("\n--dry-run: from here on, this would happen:", C_DIM)
@@ -626,16 +672,6 @@ def main() -> int:
             say("Aborted.", C_DIM)
             return 1
 
-    if args.full:
-        try:
-            refresh_python_version(root, args.dry_run)
-        except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 -- siehe build_and_swap:
-            # jeder Fehler hier muss klar gemeldet werden. Passiert vor jeder
-            # Backup-/Build-Aktion unten, pyproject.toml/uv.lock sind also so
-            # oder so unveraendert.
-            say(f"\n{e}", C_ERR)
-            return 1
-
     # ---- 2. Backup --------------------------------------------------------
     stamp = datetime.now(UTC).astimezone().strftime("%Y%m%d-%H%M%S")
     backup = root / ".uv-refresh-backup" / stamp
@@ -646,7 +682,7 @@ def main() -> int:
     )
 
     try:
-        build_and_swap(root, pyproject, lock, backup, original_text, specs, args)
+        build_and_swap(root, pyproject, lock, backup, original_text, specs, args, latest_python)
     except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 -- Notbremse: bei
         # JEDEM Fehler (uv, Dateisystem, Interrupt, ...) klar melden. Der Aufbau
         # geschah in einem Temp-Verzeichnis, root ist daher normalerweise
@@ -655,6 +691,25 @@ def main() -> int:
         if not args.dry_run:
             say(f"pyproject.toml unchanged. Backup is at {backup}.", C_WARN)
         return 1
+
+    # ---- 3. .python-version -------------------------------------------------
+    # Only after the atomic swap above: requires-python in the real
+    # pyproject.toml is already bumped to latest_python by now, so 'uv python
+    # pin' passes its own requires-python check instead of failing against
+    # the OLD (pre-swap) constraint.
+    if args.full and latest_python:
+        try:
+            refresh_python_version(root, args.dry_run, latest_python)
+        except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 -- siehe oben:
+            # pyproject.toml/uv.lock were already swapped successfully above;
+            # only the .python-version pin itself failed here.
+            say(f"\n{e}", C_ERR)
+            if not args.dry_run:
+                say(
+                    "pyproject.toml/uv.lock were already refreshed; only the .python-version pin failed.",
+                    C_WARN,
+                )
+            return 1
 
     if args.dry_run:
         say("\n--dry-run: nothing was changed.", C_OK)
