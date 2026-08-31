@@ -10,7 +10,11 @@ resolved instead of dragging along old version pins.
    entries in `dependency-groups` are resolved, not dropped)
 2. Back up `pyproject.toml` and `uv.lock` into `.uv-refresh-backup/<timestamp>/`
 3. Run `uv init --bare` + `uv add <packages>` in a temp directory next to
-   the project -- the real `pyproject.toml` stays untouched the whole time
+   the project -- the real `pyproject.toml` stays untouched the whole time.
+   The project's `.python-version` (if any) and `[tool.uv.sources]`/
+   `[tool.uv.index]` (if any) are copied into that temp directory first, so
+   the resolution happens against the same interpreter and package indexes
+   the real project actually uses
 4. Merge only `dependencies`/`optional-dependencies`/`dependency-groups`
    from the result into a copy of the ORIGINAL `pyproject.toml` -- everything
    else stays untouched
@@ -80,6 +84,23 @@ installed* Python it can find (`uv python list --only-installed` -- it
 never triggers a download on its own), e.g. `>=3.11` becomes `>=3.13`. That
 bump is part of the same atomic pyproject.toml rebuild as the dependency
 refresh, so it's covered by the same backup/all-or-nothing guarantee.
+
+## Why the temp build copies `.python-version` and `[tool.uv.sources]`
+
+A bare `uv init --python=<requires-python floor>` only writes that floor
+(e.g. `>=3.11`) into `requires-python`, not an exact interpreter pin. Left
+alone, the temp `uv add` would then resolve/install against the *newest*
+installed Python satisfying that floor, even if the real project's own
+`.python-version` pins an older one -- and fail on any dependency (e.g.
+`torch`) that has no wheel for that newer version, despite the real project
+working fine on its actual pinned interpreter. Likewise, a package pinned to
+a custom/explicit index (`[tool.uv.sources]`, e.g. PyTorch's CUDA wheel
+index) would otherwise get re-resolved against plain PyPI during the temp
+build, silently landing on a different distribution. uv-refresh copies both
+into the temp directory before running `uv add` so the refresh resolves
+against the same interpreter and indexes the real project already uses.
+`--full` is the one exception for the interpreter: it deliberately targets
+the newest installed Python instead of the old pin.
 
 Only once that rebuild has landed does `--full` re-pin `.python-version` via
 `uv python pin` to that same version. This runs *after* the rebuild on

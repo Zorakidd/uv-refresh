@@ -9,7 +9,10 @@ Steps:
      specifiers (extras and environment markers are kept, see --drop-extras)
   2. Back up pyproject.toml + uv.lock into a backup folder
   3. Run uv init --bare + uv add <names> in a temp directory next to the
-     project -- the real pyproject.toml stays untouched the whole time
+     project -- the real pyproject.toml stays untouched the whole time.
+     .python-version and [tool.uv.sources]/[tool.uv.index] (if present) are
+     copied into that temp directory first, so resolution happens against the
+     same interpreter and package indexes the real project actually uses
   4. Merge only dependencies/optional-dependencies/dependency-groups from
      the result into a copy of the ORIGINAL pyproject.toml -- everything
      else (description, readme, license, authors, keywords, [project.urls],
@@ -325,6 +328,63 @@ def refresh_python_version(root: Path, dry: bool, version: str) -> None:
     run(["uv", "python", "pin", version], root, dry)
 
 
+def pin_build_interpreter(build_dir: Path, root: Path, latest_python: str | None) -> None:
+    """Pins the temp build to whichever interpreter 'uv add' should actually
+    resolve/install against, instead of whatever's newest installed.
+
+    'uv init --python=<requires-python floor>' (see build_and_swap) only
+    writes that floor into requires-python -- it does not pin an exact
+    interpreter (confirmed: a bare init with --python='>=3.11' leaves no
+    .python-version behind). Left alone, 'uv add' below then picks the
+    NEWEST installed Python satisfying that floor, even when the real
+    project's own .python-version already pins an older one. If a dependency
+    (e.g. torch) has no wheel for that newer version, 'uv add' fails here
+    even though the real project works fine on its actual pinned interpreter.
+
+    --full is the exception: it's deliberately moving the project to
+    latest_python (already looked up by main()), so the temp build should
+    resolve against THAT version, not the old pin it's about to replace.
+    """
+    if latest_python:
+        version = latest_python
+    else:
+        existing = root / ".python-version"
+        if not existing.is_file():
+            return
+        version = existing.read_text(encoding="utf-8").strip()
+        if not version:
+            return
+    (build_dir / ".python-version").write_text(version + "\n", encoding="utf-8")
+
+
+def copy_tool_uv_sources(build_dir: Path, original_text: str) -> None:
+    """Carries [tool.uv.sources] / [tool.uv.index] over into the freshly
+    uv-init'd temp pyproject.toml, before 'uv add' runs there.
+
+    merge_dependencies() already leaves these two untouched in the FINAL
+    pyproject.toml (they live under [tool], which it never edits) -- but the
+    temp 'uv add' below runs against a bare pyproject.toml from 'uv init'
+    that doesn't have them yet. Without this, a package pinned to an
+    explicit/custom index (e.g. PyTorch's CUDA wheel index) gets re-resolved
+    against plain PyPI instead during the temp build -- silently landing on a
+    different distribution (or one with no wheel at all for the interpreter
+    in use) instead of the one the real project actually uses.
+    """
+    orig_tool_uv = tomllib.loads(original_text).get("tool", {}).get("uv", {})
+    sources = orig_tool_uv.get("sources")
+    index = orig_tool_uv.get("index")
+    if not sources and not index:
+        return
+    temp_path = build_dir / "pyproject.toml"
+    doc = tomlkit.parse(temp_path.read_text(encoding="utf-8"))
+    uv_table = doc.setdefault("tool", tomlkit.table()).setdefault("uv", tomlkit.table())
+    if sources:
+        uv_table["sources"] = sources
+    if index:
+        uv_table["index"] = index
+    temp_path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+
+
 def _toml_array(values: list[str]):
     arr = tomlkit.array()
     for v in values:
@@ -501,6 +561,10 @@ def build_and_swap(
                 raise
             say("  uv init with --python failed, retrying without it", C_WARN)
             run([f for f in init if not f.startswith("--python=")], build_dir, args.dry_run, args.timeout)
+
+        if not args.dry_run:
+            pin_build_interpreter(build_dir, root, latest_python)
+            copy_tool_uv_sources(build_dir, original_text)
 
         # ---- 4. uv add --------------------------------------------------
         flags: list[str] = []

@@ -253,6 +253,46 @@ def test_main_success_swaps_pyproject_and_lock(tmp_path, monkeypatch):
     assert not any(tmp_path.glob(".uv-refresh-tmp-*"))  # temp build dir cleaned up
 
 
+def test_main_copies_python_version_and_sources_into_temp_build(tmp_path, monkeypatch):
+    # regression test for the AudioSeparator bug report: without this, 'uv
+    # add' in the temp dir picks the newest installed Python (ignoring the
+    # real project's .python-version) and resolves pinned-index packages
+    # (e.g. torch's CUDA wheels) against plain PyPI instead.
+    original = (
+        '[project]\nname = "demo"\nversion = "1.0.0"\n'
+        'dependencies = ["torch==2.5.1"]\n\n'
+        '[tool.uv.sources]\ntorch = [{ index = "pytorch-cu121" }]\n\n'
+        '[[tool.uv.index]]\nname = "pytorch-cu121"\n'
+        'url = "https://download.pytorch.org/whl/cu121"\nexplicit = true\n'
+    )
+    (tmp_path / "pyproject.toml").write_text(original, encoding="utf-8")
+    (tmp_path / ".python-version").write_text("3.11\n", encoding="utf-8")
+
+    seen_at_add = {}
+
+    def fake_run(cmd, cwd, dry, timeout=None):
+        if cmd[:2] == ["uv", "init"]:
+            (cwd / "pyproject.toml").write_text(
+                '[project]\nname = "demo"\nversion = "0.0.0"\n', encoding="utf-8")
+        elif cmd[:2] == ["uv", "add"]:
+            seen_at_add["python_version"] = (cwd / ".python-version").read_text(encoding="utf-8")
+            seen_at_add["pyproject"] = tomllib.loads(
+                (cwd / "pyproject.toml").read_text(encoding="utf-8"))
+            (cwd / "pyproject.toml").write_text(
+                '[project]\nname = "demo"\nversion = "0.0.0"\n'
+                'dependencies = ["torch==2.5.1"]\n', encoding="utf-8")
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes"])
+
+    assert cli.main() == 0
+
+    assert seen_at_add["python_version"] == "3.11\n"
+    assert seen_at_add["pyproject"]["tool"]["uv"]["sources"]["torch"] == [{"index": "pytorch-cu121"}]
+    assert seen_at_add["pyproject"]["tool"]["uv"]["index"][0]["name"] == "pytorch-cu121"
+
+
 def test_main_full_bumps_requires_python_and_pins_python(tmp_path, monkeypatch):
     # end-to-end through main(): --full should (a) tell 'uv init' to target
     # the newest installed Python, (b) end up with that same floor written to
@@ -496,6 +536,68 @@ def test_refresh_python_version_pins_the_given_version(tmp_path, monkeypatch):
     cli.refresh_python_version(tmp_path, dry=False, version="3.13.5")
 
     assert calls == [(["uv", "python", "pin", "3.13.5"], tmp_path, False)]
+
+
+def test_pin_build_interpreter_prefers_latest_python_over_existing_pin(tmp_path):
+    # --full is deliberately moving the project past the old pin, so the temp
+    # build should resolve against the NEW target version, not the old one.
+    build_dir, root = tmp_path / "build", tmp_path / "root"
+    build_dir.mkdir()
+    root.mkdir()
+    (root / ".python-version").write_text("3.11\n", encoding="utf-8")
+
+    cli.pin_build_interpreter(build_dir, root, latest_python="3.14.0")
+
+    assert (build_dir / ".python-version").read_text(encoding="utf-8") == "3.14.0\n"
+
+
+def test_pin_build_interpreter_copies_existing_pin(tmp_path):
+    build_dir, root = tmp_path / "build", tmp_path / "root"
+    build_dir.mkdir()
+    root.mkdir()
+    (root / ".python-version").write_text("3.11\n", encoding="utf-8")
+
+    cli.pin_build_interpreter(build_dir, root, latest_python=None)
+
+    assert (build_dir / ".python-version").read_text(encoding="utf-8") == "3.11\n"
+
+
+def test_pin_build_interpreter_noop_without_pin_or_full(tmp_path):
+    build_dir, root = tmp_path / "build", tmp_path / "root"
+    build_dir.mkdir()
+    root.mkdir()
+
+    cli.pin_build_interpreter(build_dir, root, latest_python=None)
+
+    assert not (build_dir / ".python-version").exists()
+
+
+def test_copy_tool_uv_sources_injects_into_temp_pyproject(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "demo"\ndependencies = []\n', encoding="utf-8"
+    )
+    original_text = (
+        '[project]\nname = "demo"\ndependencies = ["torch==2.5.1"]\n\n'
+        '[tool.uv.sources]\ntorch = [{ index = "pytorch-cu121" }]\n\n'
+        '[[tool.uv.index]]\nname = "pytorch-cu121"\n'
+        'url = "https://download.pytorch.org/whl/cu121"\nexplicit = true\n'
+    )
+
+    cli.copy_tool_uv_sources(tmp_path, original_text)
+
+    result = tomllib.loads((tmp_path / "pyproject.toml").read_text(encoding="utf-8"))
+    assert result["tool"]["uv"]["sources"]["torch"] == [{"index": "pytorch-cu121"}]
+    assert result["tool"]["uv"]["index"][0]["name"] == "pytorch-cu121"
+    assert result["project"]["name"] == "demo"  # rest of the temp file untouched
+
+
+def test_copy_tool_uv_sources_noop_without_tool_uv(tmp_path):
+    text = '[project]\nname = "demo"\ndependencies = []\n'
+    (tmp_path / "pyproject.toml").write_text(text, encoding="utf-8")
+
+    cli.copy_tool_uv_sources(tmp_path, text)
+
+    assert (tmp_path / "pyproject.toml").read_text(encoding="utf-8") == text
 
 
 def test_main_full_skips_bump_and_pin_when_nothing_installed(tmp_path, monkeypatch, capsys):
