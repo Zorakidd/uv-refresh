@@ -347,7 +347,8 @@ def test_main_full_keeps_requires_python_already_at_that_minor(tmp_path, monkeyp
 def test_main_full_exact_pin_skips_the_pin_instead_of_failing(tmp_path, monkeypatch, capsys):
     # regression test: '==3.13' is kept (a '>=3.13' rewrite would loosen
     # it), but 3.13.5 doesn't satisfy it -- 'uv python pin' would refuse
-    # AFTER a successful rebuild and turn it into exit 1. Skip it up front.
+    # AFTER a successful rebuild and turn it into exit 1. Skip it up front
+    # (found by checking the new helpers against packaging's specifier logic).
     code, calls, requires_python = _run_main_full(tmp_path, monkeypatch, "==3.13", "3.13.5")
 
     assert code == 0
@@ -371,7 +372,8 @@ def test_main_full_bump_ignores_the_old_upper_bound(tmp_path, monkeypatch):
 def test_main_rejects_non_string_requires_python_up_front(tmp_path, monkeypatch, capsys, flags):
     # regression test: 'requires-python = 3.11' (a TOML float) crashed --full
     # with an AttributeError traceback; without --full, uv only rejected it
-    # later, after a backup had already been made.
+    # later, after a backup had already been made (both reproduced against
+    # real uv).
     pyproject = tmp_path / "pyproject.toml"
     pyproject.write_text(
         '[project]\nname = "demo"\nversion = "1.0.0"\nrequires-python = 3.11\n'
@@ -593,7 +595,8 @@ def test_latest_installed_python_picks_first_entry(monkeypatch):
 def test_latest_installed_python_skips_prereleases(monkeypatch, payload, expected):
     # regression test: the result becomes a requires-python floor under
     # --full -- an installed rc must not turn into '>=3.15' for a published
-    # package (uv really lists e.g. cpython-3.15.0rc2 once installed).
+    # package (uv offers cpython-3.15.0rc2 right now, and its JSON gives the
+    # version exactly like that: '3.15.0rc2').
     monkeypatch.setattr(
         cli.subprocess, "run",
         lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout=payload),

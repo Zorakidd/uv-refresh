@@ -20,10 +20,10 @@ If any step fails -- including Ctrl+C -- the real pyproject.toml was never
 touched, since the whole build happened in the temp directory. The backup
 is kept around as an extra reference regardless.
 
---full additionally bumps requires-python to the newest installed (non
-pre-release) Python as part of step 4 (so it's covered by the same atomic
-swap in step 5) -- never lowering it -- then re-pins .python-version to
-match once that swap has landed.
+--full additionally bumps requires-python to the newest installed Python as
+part of step 4, so it's covered by the same atomic swap in step 5, then
+re-pins .python-version to match once that swap has landed. It only ever
+raises requires-python, and ignores pre-release Pythons.
 
 Usage:
   uv-refresh                 # in the project directory, asks for confirmation
@@ -65,7 +65,7 @@ except ModuleNotFoundError:  # Fallback, damit das Skript auch nackt laeuft
 # a second import shares its try
 try:
     from packaging.specifiers import InvalidSpecifier, SpecifierSet
-except ModuleNotFoundError:  # dito -- python_allowed() then checks the lower bound only
+except ModuleNotFoundError:  # same fallback -- python_allowed() then only checks the lower bound
     SpecifierSet = None
     InvalidSpecifier = ValueError  # ty: ignore[invalid-assignment]
 
@@ -739,7 +739,7 @@ def main() -> int:
         latest = latest_installed_python()
         if latest is None:
             say(
-                "  --full: no installed Python found (uv python list, pre-releases skipped), "
+                "\n--full: no installed Python found (uv python list, pre-releases skipped), "
                 "leaving requires-python/.python-version unchanged",
                 C_WARN,
             )
@@ -766,7 +766,7 @@ def main() -> int:
             # python pin' would refuse, and lowering or loosening
             # requires-python to make it fit is not ours to decide
             say(
-                f"  --full: newest installed Python {latest} doesn't satisfy "
+                f"\n--full: newest installed Python {latest} doesn't satisfy "
                 f"requires-python {specs.requires_python}, "
                 "leaving requires-python/.python-version unchanged",
                 C_WARN,
@@ -805,8 +805,8 @@ def main() -> int:
             say(f"pyproject.toml unchanged. Backup is at {backup}.", C_WARN)
         return 1
 
-    # ---- 3. .python-version -------------------------------------------------
-    # Only after the atomic swap above: if requires-python had to go up to
+    # ---- 7. .python-version ------------------------------------------------
+    # (steps 2-6 are build_and_swap's) Only after the atomic swap above: if requires-python had to go up to
     # allow pin_python, the real pyproject.toml has that bump by now, so 'uv
     # python pin' passes its own requires-python check instead of failing
     # against the OLD (pre-swap) constraint.
