@@ -499,6 +499,13 @@ def load_project_specs(pyproject: Path, args: argparse.Namespace) -> tuple[str, 
     if not project:
         die("No [project] section found. Is this a uv/PEP 621 project?")
 
+    # e.g. 'requires-python = 3.11' (a TOML float): uv rejects the project
+    # anyway, and --full's specifier helpers would crash on it -- say so up
+    # front instead, before any backup is made
+    requires_python = project.get("requires-python")
+    if requires_python is not None and not isinstance(requires_python, str):
+        die(f'requires-python must be a string like ">=3.11", not {requires_python!r}')
+
     keep_extras, keep_markers = not args.drop_extras, not args.drop_markers
     main_deps = specs_from(project.get("dependencies", []), keep_extras, keep_markers)
 
@@ -521,7 +528,7 @@ def load_project_specs(pyproject: Path, args: argparse.Namespace) -> tuple[str, 
 
     return original_text, ProjectSpecs(
         name=project.get("name"),
-        requires_python=project.get("requires-python"),
+        requires_python=requires_python,
         description=project.get("description"),
         main_deps=main_deps,
         extras=extras,

@@ -367,6 +367,29 @@ def test_main_full_bump_ignores_the_old_upper_bound(tmp_path, monkeypatch):
     assert ["uv", "python", "pin", "3.14.7"] in calls
 
 
+@pytest.mark.parametrize("flags", [["--full"], []])
+def test_main_rejects_non_string_requires_python_up_front(tmp_path, monkeypatch, capsys, flags):
+    # regression test: 'requires-python = 3.11' (a TOML float) crashed --full
+    # with an AttributeError traceback; without --full, uv only rejected it
+    # later, after a backup had already been made.
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\nversion = "1.0.0"\nrequires-python = 3.11\n'
+        'dependencies = ["requests>=2.0"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(cli, "latest_installed_python", lambda: "3.14.7")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes", *flags])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    assert "requires-python must be a string" in capsys.readouterr().err
+    assert not (tmp_path / ".uv-refresh-backup").exists()
+
+
 def test_main_failure_leaves_pyproject_untouched(tmp_path, monkeypatch):
     # regression test: the flip side of the guarantee above -- a failure
     # partway through (here: 'uv add' itself) must never reach the real file.
