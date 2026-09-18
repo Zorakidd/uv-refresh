@@ -20,9 +20,10 @@ If any step fails -- including Ctrl+C -- the real pyproject.toml was never
 touched, since the whole build happened in the temp directory. The backup
 is kept around as an extra reference regardless.
 
---full additionally bumps requires-python to the newest installed Python as
-part of step 4 (so it's covered by the same atomic swap in step 5), then
-re-pins .python-version to match once that swap has landed.
+--full additionally bumps requires-python to the newest installed (non
+pre-release) Python as part of step 4 (so it's covered by the same atomic
+swap in step 5) -- never lowering it -- then re-pins .python-version to
+match once that swap has landed.
 
 Usage:
   uv-refresh                 # in the project directory, asks for confirmation
@@ -61,6 +62,8 @@ except ModuleNotFoundError:  # Fallback, damit das Skript auch nackt laeuft
     InvalidRequirement = ValueError  # ty: ignore[invalid-assignment]
 
 _SPEC_RE = re.compile(r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?P<extras>\[[^\]]*\])?")
+_RELEASE_RE = re.compile(r"\d+(?:\.\d+)*")
+_LOWER_BOUND_RE = re.compile(r"^\s*(?P<op>>=|>|~=|===|==)\s*(?P<release>\d+(?:\.\d+)*)")
 
 C_OK, C_WARN, C_ERR, C_DIM, C_OFF = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
 
@@ -276,11 +279,15 @@ def run(cmd: list[str], cwd: Path, dry: bool, timeout: float | None = None) -> N
 
 
 def latest_installed_python() -> str | None:
-    """Newest Python version 'uv python list' can find already installed
-    (uv-managed or otherwise) -- the list comes back newest first, so the
-    first entry is it. Deliberately --only-installed: --full re-pins to
-    what's already there, it should never trigger a Python download on its
-    own just to figure out what the newest version would be.
+    """Newest stable Python version 'uv python list' can find already
+    installed (uv-managed or otherwise) -- the list comes back newest first.
+    Deliberately --only-installed: --full re-pins to what's already there,
+    it should never trigger a Python download on its own just to figure out
+    what the newest version would be.
+
+    Pre-releases like '3.15.0rc2' are skipped: --full turns this version into
+    a requires-python floor, and an rc someone installed to try out must
+    never become the minimum Python of a published package.
     """
     result = subprocess.run(
         ["uv", "python", "list", "--only-installed", "--output-format", "json"],
@@ -294,7 +301,8 @@ def latest_installed_python() -> str | None:
         installs = json.loads(result.stdout)
     except json.JSONDecodeError:
         return None
-    return installs[0]["version"] if installs else None
+    stable = [i["version"] for i in installs if _RELEASE_RE.fullmatch(i["version"])]
+    return stable[0] if stable else None
 
 
 def requires_python_floor(version: str) -> str:
@@ -307,17 +315,74 @@ def requires_python_floor(version: str) -> str:
     return f">={major_minor}"
 
 
+def _release(version: str) -> tuple[int, ...]:
+    """'3.13.0' -> (3, 13): the leading numeric release segment, trailing
+    zeros dropped so 3.13 and 3.13.0 compare equal (as PEP 440 has them)."""
+    m = _RELEASE_RE.match(version.strip())
+    parts = [int(p) for p in m.group().split(".")] if m else []
+    while parts and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def requires_python_lower_bound(requires_python: str | None) -> tuple[tuple[int, ...], bool] | None:
+    """Strictest lower bound in a requires-python specifier like '>=3.11,<4',
+    as (release, inclusive) -- '>' is the one exclusive operator, '>=', '~='
+    and '==' (incl. '==3.12.*') are inclusive. None if there is no lower
+    bound at all (unset, or only '<'/'!=' clauses).
+
+    A small regex instead of packaging.specifiers, so this also works in the
+    no-packaging fallback (see the import at the top).
+    """
+    bounds: list[tuple[tuple[int, ...], bool]] = []
+    for clause in (requires_python or "").split(","):
+        if m := _LOWER_BOUND_RE.match(clause):
+            bounds.append((_release(m.group("release")), m.group("op") != ">"))
+    if not bounds:
+        return None
+    # highest release wins; on a tie, '>3.12' is stricter than '>=3.12'
+    return max(bounds, key=lambda b: (b[0], not b[1]))
+
+
+def python_allowed(requires_python: str | None, version: str) -> bool:
+    """Whether 'version' clears requires-python's lower bound. Upper bounds
+    are deliberately ignored: whenever 'version' is above the floor, --full
+    replaces the whole specifier with a new floor anyway."""
+    bound = requires_python_lower_bound(requires_python)
+    if bound is None:
+        return True
+    release, inclusive = bound
+    v = _release(version)
+    return v > release or (inclusive and v == release)
+
+
+def bumped_requires_python(requires_python: str | None, version: str) -> str | None:
+    """--full: the requires-python to write for 'version' -- its major.minor
+    floor (see requires_python_floor), but only if that's actually HIGHER
+    than the project's current lower bound. None means keep requires-python
+    as it is: writing the floor anyway could LOWER it, e.g. '>=3.15' ->
+    '>=3.14' on a machine whose newest Python happens to be 3.14 -- silently
+    widening what the project claims to support.
+    """
+    floor = requires_python_floor(version)
+    bound = requires_python_lower_bound(requires_python)
+    if bound is not None and _release(floor.removeprefix(">=")) <= bound[0]:
+        return None
+    return floor
+
+
 def refresh_python_version(root: Path, dry: bool, version: str) -> None:
     """--full: drops whatever .python-version currently pins and re-pins the
     project to 'version' (the newest installed Python -- main() already
-    looked it up and used it to bump requires-python in the same rebuild).
+    looked it up, checked requires-python allows it, and bumped
+    requires-python in the same rebuild where that was needed).
 
     No separate delete step: 'uv python pin' overwrites an existing pin (or
     creates a fresh one) directly, and -- crucially -- refuses to write
     anything at all if the target version doesn't satisfy requires-python.
 
-    Runs AFTER build_and_swap(), not before: requires-python is bumped as
-    part of that same atomic pyproject.toml rebuild, so requires-python
+    Runs AFTER build_and_swap(), not before: requires-python is bumped (if
+    needed) as part of that same atomic pyproject.toml rebuild, so it
     already allows 'version' by the time this pin runs. Pinning first (the
     old order) would fail here whenever --full jumps to a Python newer than
     the OLD requires-python permitted -- exactly the case --full is for.
@@ -454,7 +519,7 @@ def build_and_swap(
     original_text: str,
     specs: ProjectSpecs,
     args: argparse.Namespace,
-    latest_python: str | None = None,
+    new_requires_python: str | None = None,
 ) -> None:
     """Runs steps 2-6: backup, 'uv init' + 'uv add' in a temp directory, merge
     the freshly resolved dependencies into a copy of the ORIGINAL
@@ -464,11 +529,11 @@ def build_and_swap(
     if this raises (including on KeyboardInterrupt), they are guaranteed
     unchanged -- 'backup' is kept regardless, as an extra safety net.
 
-    latest_python is only set when --full found an installed Python (main()
-    looked it up); when set, requires-python is bumped to match it as part
-    of this same atomic rebuild, and 'uv init' below targets it too --
-    main() re-pins .python-version to it afterwards, once requires-python
-    already allows that pin.
+    new_requires_python is only set when --full decided requires-python has
+    to go up (see main() / bumped_requires_python()); it's then written as
+    part of this same atomic rebuild, and 'uv init' below targets it too --
+    main() re-pins .python-version afterwards, once requires-python already
+    allows that pin.
     """
     build_ctx = (
         tempfile.TemporaryDirectory(dir=root, prefix=".uv-refresh-tmp-")
@@ -491,7 +556,6 @@ def build_and_swap(
             shutil.copy2(lock, build_dir / "uv.lock")
 
         # ---- 3. uv init -----------------------------------------------
-        new_requires_python = requires_python_floor(latest_python) if latest_python else None
         init_python = new_requires_python or specs.requires_python
         init = build_init_cmd(specs.name, init_python, specs.description)
         try:
@@ -638,31 +702,51 @@ def main() -> int:
             C_WARN,
         )
 
-    # latest_python is looked up here (read-only 'uv python list') rather than
-    # inside build_and_swap(): main() needs it already for the dry-run/confirm
-    # messages below, and build_and_swap() needs that SAME value for the
-    # requires-python bump -- a second lookup there could return something
+    # --full is decided once, here (read-only 'uv python list') rather than
+    # inside build_and_swap(): the dry-run/confirm messages below need it
+    # already, and the requires-python bump and the pin after the swap must
+    # both use the SAME lookup -- a second one could return something
     # different (e.g. a Python installed in between).
-    latest_python: str | None = None
+    new_requires_python: str | None = None
+    pin_python: str | None = None
     if args.full:
-        latest_python = latest_installed_python()
-        if latest_python is None:
+        latest = latest_installed_python()
+        if latest is None:
             say(
-                "  --full: no installed Python found (uv python list), "
+                "  --full: no installed Python found (uv python list, pre-releases skipped), "
+                "leaving requires-python/.python-version unchanged",
+                C_WARN,
+            )
+        elif not python_allowed(specs.requires_python, latest):
+            # re-pinning is impossible ('uv python pin' would refuse), and
+            # lowering requires-python to make it fit is not ours to decide
+            say(
+                f"  --full: newest installed Python {latest} is older than "
+                f"requires-python {specs.requires_python}, "
                 "leaving requires-python/.python-version unchanged",
                 C_WARN,
             )
         else:
-            say(
-                f"\n--full: requires-python will be bumped to {requires_python_floor(latest_python)} "
-                f"and .python-version re-pinned to {latest_python}.",
-                C_DIM,
-            )
+            pin_python = latest
+            new_requires_python = bumped_requires_python(specs.requires_python, latest)
+            if new_requires_python:
+                say(
+                    f"\n--full: requires-python will be bumped to {new_requires_python} "
+                    f"and .python-version re-pinned to {latest}.",
+                    C_DIM,
+                )
+            else:
+                say(
+                    f"\n--full: requires-python {specs.requires_python} already starts at "
+                    f"Python {latest}'s minor version or above, kept as is; "
+                    f".python-version will be re-pinned to {latest}.",
+                    C_DIM,
+                )
 
     if args.dry_run:
         say("\n--dry-run: from here on, this would happen:", C_DIM)
     elif not args.yes:
-        prompt = "Rebuild pyproject.toml (and re-pin Python) now? [Y/N] " if args.full \
+        prompt = "Rebuild pyproject.toml (and re-pin Python) now? [Y/N] " if pin_python \
             else "Rebuild pyproject.toml now? [Y/N] "
         try:
             answer = input(f"\n{prompt}").strip().lower()
@@ -682,7 +766,7 @@ def main() -> int:
     )
 
     try:
-        build_and_swap(root, pyproject, lock, backup, original_text, specs, args, latest_python)
+        build_and_swap(root, pyproject, lock, backup, original_text, specs, args, new_requires_python)
     except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 -- Notbremse: bei
         # JEDEM Fehler (uv, Dateisystem, Interrupt, ...) klar melden. Der Aufbau
         # geschah in einem Temp-Verzeichnis, root ist daher normalerweise
@@ -693,13 +777,13 @@ def main() -> int:
         return 1
 
     # ---- 3. .python-version -------------------------------------------------
-    # Only after the atomic swap above: requires-python in the real
-    # pyproject.toml is already bumped to latest_python by now, so 'uv python
-    # pin' passes its own requires-python check instead of failing against
-    # the OLD (pre-swap) constraint.
-    if args.full and latest_python:
+    # Only after the atomic swap above: if requires-python had to go up to
+    # allow pin_python, the real pyproject.toml has that bump by now, so 'uv
+    # python pin' passes its own requires-python check instead of failing
+    # against the OLD (pre-swap) constraint.
+    if pin_python:
         try:
-            refresh_python_version(root, args.dry_run, latest_python)
+            refresh_python_version(root, args.dry_run, pin_python)
         except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 -- siehe oben:
             # pyproject.toml/uv.lock were already swapped successfully above;
             # only the .python-version pin itself failed here.

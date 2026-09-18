@@ -210,12 +210,15 @@ def test_main_dry_run_leaves_project_untouched(tmp_path, monkeypatch):
     assert not any(tmp_path.glob(".uv-refresh-tmp-*"))
 
 
-def _stub_run_writing(resolved_pyproject_text):
+def _stub_run_writing(resolved_pyproject_text, calls=None):
     """Fakes cli.run(): 'uv init' seeds a minimal pyproject.toml in the build
     dir, 'uv add' overwrites it with the given already-resolved text -- close
-    enough to real uv output for build_and_swap()'s merge step to work on."""
+    enough to real uv output for build_and_swap()'s merge step to work on.
+    Every command is also appended to 'calls', if given."""
 
     def fake_run(cmd, cwd, dry, timeout=None):
+        if calls is not None:
+            calls.append(cmd)
         if cmd[:2] == ["uv", "init"]:
             (cwd / "pyproject.toml").write_text(
                 '[project]\nname = "demo"\nversion = "0.0.0"\n', encoding="utf-8")
@@ -293,6 +296,54 @@ def test_main_full_bumps_requires_python_and_pins_python(tmp_path, monkeypatch):
     assert result["project"]["dependencies"] == ["requests==2.31.0"]
 
 
+def _run_main_full(tmp_path, monkeypatch, requires_python, latest):
+    """main() --full --yes on a project with the given requires-python, with
+    'latest' as the newest installed Python; returns (exit code, uv commands
+    run, resulting requires-python)."""
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        f'[project]\nname = "demo"\nversion = "1.0.0"\nrequires-python = "{requires_python}"\n'
+        'dependencies = ["requests>=2.0"]\n',
+        encoding="utf-8",
+    )
+    calls = []
+    monkeypatch.setattr(cli, "run", _stub_run_writing(
+        '[project]\nname = "demo"\nversion = "0.0.0"\ndependencies = ["requests==2.31.0"]\n', calls
+    ))
+    monkeypatch.setattr(cli, "latest_installed_python", lambda: latest)
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes", "--full"])
+
+    code = cli.main()
+    result = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    return code, calls, result["project"]["requires-python"]
+
+
+def test_main_full_never_lowers_requires_python(tmp_path, monkeypatch, capsys):
+    # regression test: --full used to write the newest installed Python's
+    # floor unconditionally -- on a machine that only has 3.14, a '>=3.15'
+    # project came out as '>=3.14' (reproduced against real uv), reported as
+    # a "bump". Now requires-python and .python-version are both left alone,
+    # and the dependency refresh still happens.
+    code, calls, requires_python = _run_main_full(tmp_path, monkeypatch, ">=3.15", "3.14.7")
+
+    assert code == 0
+    assert requires_python == ">=3.15"
+    assert "--python=>=3.15" in next(c for c in calls if c[:2] == ["uv", "init"])
+    assert not any(c[:3] == ["uv", "python", "pin"] for c in calls)
+    assert "older than requires-python >=3.15" in capsys.readouterr().err
+
+
+def test_main_full_keeps_requires_python_already_at_that_minor(tmp_path, monkeypatch):
+    # same minor version (or a stricter patch floor): nothing to bump, but
+    # .python-version still gets re-pinned -- that part is still wanted.
+    code, calls, requires_python = _run_main_full(tmp_path, monkeypatch, ">=3.14.2", "3.14.7")
+
+    assert code == 0
+    assert requires_python == ">=3.14.2"
+    assert ["uv", "python", "pin", "3.14.7"] in calls
+
+
 def test_main_failure_leaves_pyproject_untouched(tmp_path, monkeypatch):
     # regression test: the flip side of the guarantee above -- a failure
     # partway through (here: 'uv add' itself) must never reach the real file.
@@ -347,6 +398,23 @@ def test_main_confirmation_rejects_anything_else(tmp_path, monkeypatch):
 
     assert cli.main() == 1
     assert started == []
+
+
+@pytest.mark.parametrize(("latest", "mentions_pin"), [("3.14.0", True), (None, False)])
+def test_main_full_prompt_mentions_pin_only_when_pinning(tmp_path, monkeypatch, latest, mentions_pin):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--full"])
+    monkeypatch.setattr(cli, "latest_installed_python", lambda: latest)
+    prompts = []
+    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or "n")
+
+    assert cli.main() == 1
+    assert ("re-pin Python" in prompts[0]) is mentions_pin
 
 
 def test_prune_backups_keeps_newest_n(tmp_path):
@@ -469,6 +537,24 @@ def test_latest_installed_python_picks_first_entry(monkeypatch):
     assert cli.latest_installed_python() == "3.13.5"
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ('[{"version": "3.15.0rc2"}, {"version": "3.14.7"}]', "3.14.7"),
+        ('[{"version": "3.15.0a1"}]', None),
+    ],
+)
+def test_latest_installed_python_skips_prereleases(monkeypatch, payload, expected):
+    # regression test: the result becomes a requires-python floor under
+    # --full -- an installed rc must not turn into '>=3.15' for a published
+    # package (uv really lists e.g. cpython-3.15.0rc2 once installed).
+    monkeypatch.setattr(
+        cli.subprocess, "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout=payload),
+    )
+    assert cli.latest_installed_python() == expected
+
+
 def test_latest_installed_python_returns_none_on_failure(monkeypatch):
     monkeypatch.setattr(
         cli.subprocess, "run",
@@ -489,6 +575,57 @@ def test_requires_python_floor_truncates_to_major_minor():
     assert cli.requires_python_floor("3.13.5") == ">=3.13"
 
 
+@pytest.mark.parametrize(
+    ("requires_python", "expected"),
+    [
+        (None, None),
+        ("<3.13", None),
+        (">=3.11", ((3, 11), True)),
+        (">= 3.11, <4", ((3, 11), True)),
+        (">3.12", ((3, 12), False)),
+        ("~=3.12", ((3, 12), True)),
+        ("==3.12.*", ((3, 12), True)),
+        (">=3.12.0", ((3, 12), True)),
+        (">=3.10,>=3.12.1", ((3, 12, 1), True)),
+        (">=3.12,>3.12", ((3, 12), False)),
+    ],
+)
+def test_requires_python_lower_bound(requires_python, expected):
+    assert cli.requires_python_lower_bound(requires_python) == expected
+
+
+@pytest.mark.parametrize(
+    ("requires_python", "version", "expected"),
+    [
+        (None, "3.14.7", True),
+        (">=3.14", "3.14.0", True),
+        (">=3.15", "3.14.7", False),
+        (">=3.14.2", "3.14.1", False),
+        (">3.14", "3.14.0", False),
+        (">3.14", "3.14.1", True),
+        (">=3.10,<3.13", "3.14.7", True),  # upper bounds ignored, see python_allowed()
+    ],
+)
+def test_python_allowed(requires_python, version, expected):
+    assert cli.python_allowed(requires_python, version) is expected
+
+
+@pytest.mark.parametrize(
+    ("requires_python", "version", "expected"),
+    [
+        (">=3.11", "3.14.7", ">=3.14"),
+        (None, "3.14.7", ">=3.14"),
+        (">=3.10,<3.13", "3.14.7", ">=3.14"),
+        (">=3.14", "3.14.7", None),     # already there -- no churn
+        (">=3.14.2", "3.14.7", None),   # '>=3.14' would loosen it
+        (">3.14", "3.14.7", None),      # same
+        (">=3.15", "3.14.7", None),     # would LOWER it
+    ],
+)
+def test_bumped_requires_python_only_ever_raises(requires_python, version, expected):
+    assert cli.bumped_requires_python(requires_python, version) == expected
+
+
 def test_refresh_python_version_pins_the_given_version(tmp_path, monkeypatch):
     calls = []
     monkeypatch.setattr(cli, "run", lambda cmd, cwd, dry, timeout=None: calls.append((cmd, cwd, dry)))
@@ -501,7 +638,7 @@ def test_refresh_python_version_pins_the_given_version(tmp_path, monkeypatch):
 def test_main_full_skips_bump_and_pin_when_nothing_installed(tmp_path, monkeypatch, capsys):
     # no installed Python found -> neither the requires-python bump nor the
     # .python-version pin should happen; build_and_swap still runs (a plain
-    # dependency refresh), just with latest_python=None.
+    # dependency refresh), just with new_requires_python=None.
     pyproject = tmp_path / "pyproject.toml"
     pyproject.write_text(
         '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n',
@@ -518,7 +655,7 @@ def test_main_full_skips_bump_and_pin_when_nothing_installed(tmp_path, monkeypat
 
     assert cli.main() == 0
     assert len(build_calls) == 1
-    assert build_calls[0][-1] is None  # latest_python passed through as None
+    assert build_calls[0][-1] is None  # no requires-python bump
     assert refresh_calls == []
     assert "no installed Python found" in capsys.readouterr().err
 
@@ -539,8 +676,8 @@ def test_main_full_runs_build_then_pin_with_latest_version(tmp_path, monkeypatch
     order = []
     monkeypatch.setattr(
         cli, "build_and_swap",
-        lambda root, pyproject, lock, backup, original_text, specs, args, latest_python:
-            order.append(("build", latest_python)),
+        lambda root, pyproject, lock, backup, original_text, specs, args, new_requires_python:
+            order.append(("build", new_requires_python)),
     )
     monkeypatch.setattr(
         cli, "refresh_python_version",
@@ -548,7 +685,7 @@ def test_main_full_runs_build_then_pin_with_latest_version(tmp_path, monkeypatch
     )
 
     assert cli.main() == 0
-    assert order == [("build", "3.14.0"), ("refresh", "3.14.0")]
+    assert order == [("build", ">=3.14"), ("refresh", "3.14.0")]
 
 
 def test_main_full_pin_failure_after_build_reports_but_keeps_the_rebuild(tmp_path, monkeypatch):

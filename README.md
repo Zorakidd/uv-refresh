@@ -81,6 +81,12 @@ never triggers a download on its own), e.g. `>=3.11` becomes `>=3.13`. That
 bump is part of the same atomic pyproject.toml rebuild as the dependency
 refresh, so it's covered by the same backup/all-or-nothing guarantee.
 
+It only ever goes *up*: pre-release Pythons (e.g. `3.15.0rc2`) are ignored,
+a `requires-python` that already starts at that minor version or above is
+kept as is, and if the newest installed Python is older than
+`requires-python` allows, `--full` leaves both `requires-python` and
+`.python-version` alone (with a warning) and just does the normal refresh.
+
 Only once that rebuild has landed does `--full` re-pin `.python-version` via
 `uv python pin` to that same version. This runs *after* the rebuild on
 purpose: `uv python pin` refuses to write anything if the target version
