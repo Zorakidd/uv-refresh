@@ -23,8 +23,9 @@ touched, since the whole build happened in the temp directory. The backup
 is kept around as an extra reference regardless.
 
 Projects the temp directory can't rebuild -- uv workspaces, relative path
-sources, a dynamic version or dependencies -- are refused up front, before
-any backup is made.
+sources or index/find-links paths, a dynamic version or dependencies -- are
+refused up front, before any backup is made. So is --no-groups on a project
+whose [tool.uv] still names one of the extras/groups it would remove.
 
 --full additionally bumps requires-python to the newest installed Python as
 part of step 4, so it's covered by the same atomic swap in step 5, then
@@ -444,7 +445,7 @@ def refresh_python_version(root: Path, dry: bool, version: str) -> None:
     run(["uv", "python", "pin", version], root, dry)
 
 
-def pin_build_interpreter(build_dir: Path, root: Path, pin_python: str | None) -> None:
+def pin_build_interpreter(build_dir: Path, root: Path, pin_python: str | None, dry: bool = False) -> None:
     """Pins the temp build to whichever interpreter 'uv add' should actually
     resolve/install against, instead of whatever's newest installed.
 
@@ -470,7 +471,10 @@ def pin_build_interpreter(build_dir: Path, root: Path, pin_python: str | None) -
         version = existing.read_text(encoding="utf-8").strip()
         if not version:
             return
-    (build_dir / ".python-version").write_text(version + "\n", encoding="utf-8")
+    if dry:
+        say(f"  $ (the temp build would be pinned to Python {version} via .python-version)", C_DIM)
+    else:
+        (build_dir / ".python-version").write_text(version + "\n", encoding="utf-8")
 
 
 def _toml_array(values: list[str]):
@@ -560,30 +564,46 @@ def seed_build_pyproject(bare_text: str, specs: ProjectSpecs) -> str:
 _DYNAMIC_NEEDS_BUILD = ("dependencies", "optional-dependencies", "requires-python", "version")
 
 
+def _source_entries(tool_uv: dict):
+    """(package name, source entry) for every [tool.uv.sources] entry -- a
+    source is either one table or a list of them (e.g. per marker/extra)."""
+    for name, source in (tool_uv.get("sources") or {}).items():
+        for entry in source if isinstance(source, list) else [source]:
+            if isinstance(entry, dict):
+                yield name, entry
+
+
 def unsupported_reason(data: dict) -> str | None:
     """Why the temp directory can't rebuild this project, or None if it can.
 
-    The temp directory holds only pyproject.toml (+ uv.lock), one level below
-    the project, so relative paths ('path'/workspace sources, workspace
-    members, '${PROJECT_ROOT}' references) resolve to the wrong place, and
-    metadata that only a build can produce (a dynamic version or
-    dependencies) fails for lack of the project's files. All of these used to
-    fail only at the final 'uv lock' -- after the backup, with a uv or
-    build-backend error that didn't say why (each reproduced against real
-    uv). Absolute 'path' sources and a dynamic readme work fine and pass.
+    The temp directory holds only pyproject.toml (+ uv.lock, .python-version),
+    one level below the project, so relative paths ('path'/workspace sources,
+    workspace members, local index/find-links directories, '${PROJECT_ROOT}'
+    references) resolve to the wrong place, and metadata that only a build
+    can produce (a dynamic version or dependencies) fails for lack of the
+    project's files. All of these used to fail only after the backup, with a
+    uv or build-backend error that didn't say why -- or worse, a relative
+    extra-index-url was silently skipped (each reproduced against real uv).
+    Absolute paths, URLs and a dynamic readme work fine and pass.
     """
     project = data.get("project", {})
     tool_uv = data.get("tool", {}).get("uv", {})
     if "workspace" in tool_uv:
         return "it's a uv workspace ([tool.uv.workspace])"
-    for name, source in (tool_uv.get("sources") or {}).items():
-        for entry in source if isinstance(source, list) else [source]:
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("workspace"):
-                return f"'{name}' is a workspace source"
-            if "path" in entry and not Path(entry["path"]).is_absolute():
-                return f"'{name}' has a relative path source ({entry['path']!r})"
+    for name, entry in _source_entries(tool_uv):
+        if entry.get("workspace"):
+            return f"'{name}' is a workspace source"
+        if "path" in entry and not Path(entry["path"]).is_absolute():
+            return f"'{name}' has a relative path source ({entry['path']!r})"
+    locations = [
+        *(i.get("url") for i in tool_uv.get("index") or [] if isinstance(i, dict)),
+        tool_uv.get("index-url"),
+        *(tool_uv.get("extra-index-url") or []),
+        *(tool_uv.get("find-links") or []),
+    ]
+    for loc in locations:
+        if isinstance(loc, str) and "://" not in loc and not Path(loc).expanduser().is_absolute():
+            return f"[tool.uv] has a relative index or find-links path ({loc!r})"
     deps = [
         *project.get("dependencies", []),
         *(d for ds in (project.get("optional-dependencies") or {}).values() for d in ds),
@@ -593,6 +613,42 @@ def unsupported_reason(data: dict) -> str | None:
         return "a dependency points into the project via ${PROJECT_ROOT}"
     if dynamic := [f for f in _DYNAMIC_NEEDS_BUILD if f in project.get("dynamic", [])]:
         return f"it lists {', '.join(dynamic)} as dynamic (computed by a build)"
+    return None
+
+
+def _canonical_name(name: str) -> str:
+    """PEP 503 normalized package name: 'My_Pkg' and 'my-pkg' are the same package."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def no_groups_blocker(tool_uv: dict) -> str | None:
+    """--no-groups: what in [tool.uv] still names an extra or group that
+    --no-groups is about to remove, or None if nothing does.
+
+    merge_dependencies() leaves [tool.uv] as it is, so such a reference would
+    outlive its extra/group -- and uv rejects that: a 'default-groups' list
+    fails 'uv add', a source limited to an extra/group fails 'uv lock' (both
+    reproduced against real uv; 'conflicts' naming them is accepted). Only
+    after the backup, too. Rewriting [tool.uv] to match is not ours to decide.
+    """
+    default_groups = tool_uv.get("default-groups")
+    if isinstance(default_groups, list) and default_groups:
+        # even default-groups = ["dev"] with legacy [tool.uv] dev-dependencies
+        # still set: uv doesn't count those as a 'dev' group here
+        return f"[tool.uv] default-groups lists {', '.join(map(str, default_groups))}"
+
+    # For a source with group = "dev", on the other hand, uv does accept
+    # legacy dev-dependencies -- but only if they list that very package
+    legacy_dev = {
+        _canonical_name(m["name"])
+        for d in tool_uv.get("dev-dependencies") or []
+        if isinstance(d, str) and (m := _SPEC_RE.match(d))
+    }
+    for name, entry in _source_entries(tool_uv):
+        if "extra" in entry:
+            return f"the [tool.uv.sources] entry for '{name}' only applies to extra {entry['extra']!r}"
+        if "group" in entry and not (entry["group"] == "dev" and _canonical_name(name) in legacy_dev):
+            return f"the [tool.uv.sources] entry for '{name}' only applies to group {entry['group']!r}"
     return None
 
 
@@ -638,8 +694,15 @@ def load_project_specs(pyproject: Path, args: argparse.Namespace) -> tuple[str, 
     if reason := unsupported_reason(data):
         die(
             f"Can't refresh this project: {reason}.\n"
-            "  uv-refresh resolves in a temp directory that holds only pyproject.toml -- "
+            "  uv-refresh resolves in a temp directory one level below the project -- "
             "relative paths point elsewhere from there, and build-time metadata needs the project's files."
+        )
+    tool_uv = data.get("tool", {}).get("uv", {})
+    if args.no_groups and (blocker := no_groups_blocker(tool_uv)):
+        die(
+            f"Can't use --no-groups here: {blocker}.\n"
+            "  uv rejects that once the extras/groups are gone -- run without --no-groups, "
+            "or remove that reference from [tool.uv] first."
         )
 
     keep_extras, keep_markers = not args.drop_extras, not args.drop_markers
@@ -670,7 +733,7 @@ def load_project_specs(pyproject: Path, args: argparse.Namespace) -> tuple[str, 
         extras=extras,
         groups=groups,
         had_groups=had_groups,
-        tool_uv=data.get("tool", {}).get("uv", {}),
+        tool_uv=tool_uv,
     )
 
 
@@ -732,15 +795,13 @@ def build_and_swap(
             say("  uv init with --python failed, retrying without it", C_WARN)
             run([f for f in init if not f.startswith("--python=")], build_dir, args.dry_run, args.timeout)
 
+        pin_build_interpreter(build_dir, root, pin_python, args.dry_run)
         if args.dry_run:
             if specs.tool_uv:
                 say("  $ (the project's [tool.uv] settings would now go into the temp pyproject.toml)", C_DIM)
-        else:
-            pin_build_interpreter(build_dir, root, pin_python)
-            if specs.tool_uv or specs.extras or specs.groups:
-                bare = build_dir / "pyproject.toml"
-                seeded = seed_build_pyproject(bare.read_text(encoding="utf-8"), specs)
-                bare.write_text(seeded, encoding="utf-8")
+        elif specs.tool_uv or specs.extras or specs.groups:
+            bare = build_dir / "pyproject.toml"
+            bare.write_text(seed_build_pyproject(bare.read_text(encoding="utf-8"), specs), encoding="utf-8")
 
         # ---- 4. uv add --------------------------------------------------
         # --no-sync: only the resolved versions matter here. Syncing installed

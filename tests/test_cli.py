@@ -497,6 +497,13 @@ _SOURCES = _D + "[tool.uv.sources]\n"
         (_SOURCES + "x = [{ path = '../x', marker = 'sys_platform == \"linux\"' }]\n", "relative path"),
         (_SOURCES + f'x = {{ path = "{_HERE}" }}\n', None),  # absolute paths work from the temp dir
         (_SOURCES + 'x = { git = "https://example.com/x.git" }\n', None),
+        (_D + '[tool.uv]\nfind-links = ["./wheels"]\n', "relative index or find-links path ('./wheels')"),
+        (_D + '[tool.uv]\nindex-url = "idx"\n', "relative index or find-links path"),
+        (_D + '[tool.uv]\nextra-index-url = ["../idx"]\n', "relative index or find-links path"),
+        (_D + '[[tool.uv.index]]\nname = "i"\nurl = "./idx"\nformat = "flat"\n', "relative index"),
+        (_D + f'[tool.uv]\nfind-links = ["{_HERE}"]\n', None),
+        (_D + '[tool.uv]\nfind-links = ["https://download.pytorch.org/whl/torch_stable.html"]\n', None),
+        (_D + '[[tool.uv.index]]\nname = "i"\nurl = "https://example.com/simple"\n', None),
         (_D + 'dependencies = ["x @ file:///${PROJECT_ROOT}/libs/x"]\n', "${PROJECT_ROOT}"),
         (_D + '[dependency-groups]\ndev = ["x @ file:///${PROJECT_ROOT}/x"]\n', "${PROJECT_ROOT}"),
         (_D + 'dynamic = ["version"]\n', "it lists version as dynamic"),
@@ -528,6 +535,63 @@ def test_main_refuses_what_the_temp_dir_cant_rebuild_before_any_backup(tmp_path,
 
     assert exc.value.code == 1
     assert "Can't refresh this project: it lists version as dynamic" in capsys.readouterr().err
+    assert pyproject.read_text(encoding="utf-8") == original
+    assert not (tmp_path / ".uv-refresh-backup").exists()
+
+
+@pytest.mark.parametrize(
+    ("tool_uv", "blocker"),
+    [
+        ("", None),
+        ('[tool.uv]\ndefault-groups = ["lint"]\n', "default-groups lists lint"),
+        # legacy dev-dependencies doesn't satisfy it either (reproduced against real uv)
+        ('[tool.uv]\ndev-dependencies = ["y"]\ndefault-groups = ["dev"]\n', "default-groups lists dev"),
+        ('[tool.uv]\ndefault-groups = "all"\n', None),
+        ('[tool.uv]\nconflicts = [[{ extra = "a" }, { extra = "b" }]]\n', None),  # uv accepts that
+        ('[tool.uv.sources]\nx = [{ index = "cu", extra = "gpu" }]\n', "only applies to extra 'gpu'"),
+        ('[tool.uv.sources]\nx = { git = "https://example.com/x.git", group = "lint" }\n', "group 'lint'"),
+        # ... but it does satisfy a source's 'group = "dev"' -- only if it lists
+        # that very package (both reproduced against real uv)
+        (
+            '[tool.uv]\ndev-dependencies = ["My_Pkg>=1"]\n\n'
+            '[tool.uv.sources]\nmy-pkg = { git = "https://example.com/x.git", group = "dev" }\n',
+            None,
+        ),
+        (
+            '[tool.uv]\ndev-dependencies = ["other"]\n\n'
+            '[tool.uv.sources]\nx = { git = "https://example.com/x.git", group = "dev" }\n',
+            "group 'dev'",
+        ),
+        ('[tool.uv.sources]\nx = { git = "https://example.com/x.git" }\n', None),
+    ],
+)
+def test_no_groups_blocker(tool_uv, blocker):
+    result = cli.no_groups_blocker(tomllib.loads(tool_uv).get("tool", {}).get("uv", {}))
+    if blocker is None:
+        assert result is None
+    else:
+        assert result is not None and blocker in result
+
+
+def test_main_no_groups_refuses_a_tool_uv_that_names_a_group_before_any_backup(tmp_path, monkeypatch, capsys):
+    # regression test: --no-groups removed [dependency-groups] but kept
+    # [tool.uv] default-groups naming one -- 'uv add' then failed with
+    # "Default group `lint` ... is not defined", after the backup (reproduced
+    # against real uv).
+    pyproject = tmp_path / "pyproject.toml"
+    original = (
+        '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n\n'
+        '[dependency-groups]\nlint = ["ruff"]\n\n[tool.uv]\ndefault-groups = ["lint"]\n'
+    )
+    pyproject.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes", "--no-groups"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    assert "Can't use --no-groups here: [tool.uv] default-groups lists lint" in capsys.readouterr().err
     assert pyproject.read_text(encoding="utf-8") == original
     assert not (tmp_path / ".uv-refresh-backup").exists()
 
@@ -865,6 +929,20 @@ def test_pin_build_interpreter_copies_existing_pin(tmp_path):
     cli.pin_build_interpreter(build_dir, root, pin_python=None)
 
     assert (build_dir / ".python-version").read_text(encoding="utf-8") == "3.11\n"
+
+
+def test_pin_build_interpreter_dry_run_only_says_so(tmp_path, capsys):
+    # --dry-run builds "in" the project root itself (nothing is created), so
+    # it must only report the pin, never write one
+    build_dir, root = tmp_path / "build", tmp_path / "root"
+    build_dir.mkdir()
+    root.mkdir()
+    (root / ".python-version").write_text("3.11\n", encoding="utf-8")
+
+    cli.pin_build_interpreter(build_dir, root, pin_python=None, dry=True)
+
+    assert not (build_dir / ".python-version").exists()
+    assert "temp build would be pinned to Python 3.11" in capsys.readouterr().out
 
 
 def test_pin_build_interpreter_noop_without_pin_or_full(tmp_path):

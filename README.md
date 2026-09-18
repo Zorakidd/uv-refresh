@@ -74,8 +74,11 @@ from it and writes those back into a copy of the original file.
 
 One exception: with `--no-groups`, any existing
 `optional-dependencies`/`dependency-groups` are intentionally removed (the
-tool warns beforehand). Individual entries that can't be interpreted as a
-PEP 508 string are skipped and reported per entry.
+tool warns beforehand). If `[tool.uv]` still names one of them (a
+`default-groups` list, or a source limited to an `extra`/`group`),
+`--no-groups` is refused up front instead, since uv rejects references to
+extras/groups that no longer exist. Individual entries that can't be
+interpreted as a PEP 508 string are skipped and reported per entry.
 
 `--full` additionally bumps `requires-python` to the newest *already
 installed* Python it can find (`uv python list --only-installed` -- it
@@ -122,6 +125,8 @@ a uv or build-backend error:
 - uv workspaces (`[tool.uv.workspace]`) and `workspace = true` sources
 - `path` sources with a relative path, and `${PROJECT_ROOT}` references
   (absolute paths work fine)
+- a relative local path in `[[tool.uv.index]]`, `index-url`,
+  `extra-index-url` or `find-links` (absolute paths and URLs work fine)
 - a dynamic `version`, `dependencies`, `optional-dependencies` or
   `requires-python` (e.g. setuptools-scm, hatch-vcs), because uv would have to
   build the project to lock it, and its files aren't in the temp directory

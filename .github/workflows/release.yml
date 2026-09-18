@@ -16,12 +16,10 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/project/uv-refresh/
     permissions:
       contents: write
-      id-token: write
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -47,28 +45,64 @@ jobs:
         # der naechste Lauf wuerde eine Version ueberspringen.
         run: uv build
 
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+
       - name: Commit, tag, push
+        # --atomic: Branch und Tag gehen zusammen durch oder gar nicht. Ohne
+        # landete bei einem abgelehnten Branch-Push (main hat sich waehrend des
+        # Laufs bewegt) der Tag trotzdem auf GitHub -- auf einem Commit, der
+        # nicht auf main liegt, und der naechste Lauf scheitert am selben Tag.
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add pyproject.toml uv.lock
           git commit -m "Release v${{ steps.bump.outputs.version }}"
           git tag "v${{ steps.bump.outputs.version }}"
-          git push origin HEAD --tags
+          git push --atomic origin HEAD "v${{ steps.bump.outputs.version }}"
+
+  publish:
+    # Eigener Job, damit ein fehlgeschlagener Upload per "Re-run failed jobs"
+    # genau diese schon gebaute und gepushte Version erneut hochlaedt. Im
+    # selben Job haette ein Re-run die Version noch einmal gebumpt und die
+    # schon getaggte uebersprungen.
+    needs: release
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/uv-refresh/
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         # Trusted Publishing (OIDC, id-token: write oben) -- der Trusted-
-        # Publisher-Eintrag auf PyPI zeigt jetzt auf release.yml/pypi.
-        # Kein password mehr noetig; PYPI_API_TOKEN kann aus den Repo-
-        # Secrets geloescht und auf PyPI revoked werden.
+        # Publisher-Eintrag auf PyPI zeigt auf release.yml/pypi (Workflow-
+        # Datei + Environment, nicht Job-Name -- der Umzug in diesen Job
+        # aendert daran nichts). Kein password mehr noetig; PYPI_API_TOKEN
+        # kann aus den Repo-Secrets geloescht und auf PyPI revoked werden.
+        with:
+          # ein Re-run nach erfolgreichem Upload (z. B. weil nur der GitHub-
+          # Release unten fehlschlug) soll nicht an "File already exists"
+          # scheitern
+          skip-existing: true
 
       - name: Create GitHub release
         # Nur noch fuer die Changelog-Seite auf GitHub -- publish ist zu diesem
         # Zeitpunkt schon passiert, haengt also nicht mehr am 'release:
         # published'-Event und braucht darum keinen PAT mehr (der Standard-
         # GITHUB_TOKEN loest zwar keine anderen Workflows aus, aber es gibt
-        # hier auch keinen anderen Workflow mehr, der darauf wartet).
+        # hier auch keinen anderen Workflow mehr, der darauf wartet). Kein
+        # Checkout in diesem Job, darum GH_REPO fuer gh.
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: gh release create "v${{ steps.bump.outputs.version }}" --generate-notes
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "v${{ needs.release.outputs.version }}" --generate-notes
