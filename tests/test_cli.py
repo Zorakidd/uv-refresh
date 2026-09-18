@@ -2,6 +2,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from pathlib import Path
 
 import pytest
 from packaging.specifiers import SpecifierSet
@@ -195,6 +196,17 @@ def test_ensure_backup_ignored_skips_non_git_dirs(tmp_path):
     assert not (tmp_path / ".gitignore").exists()
 
 
+def test_ensure_backup_ignored_also_ignores_the_temp_build_dir(tmp_path):
+    # a temp build dir left behind by a hard kill holds the same data as the
+    # backup -- it must not end up in 'git add .' either.
+    (tmp_path / ".git").mkdir()
+    cli.ensure_backup_ignored(tmp_path)
+    cli.ensure_backup_ignored(tmp_path)  # a second run adds nothing
+
+    lines = (tmp_path / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert lines == [".uv-refresh-backup/", ".uv-refresh-tmp-*/"]
+
+
 def test_main_dry_run_leaves_project_untouched(tmp_path, monkeypatch):
     pyproject = tmp_path / "pyproject.toml"
     original = (
@@ -255,6 +267,40 @@ def test_main_success_swaps_pyproject_and_lock(tmp_path, monkeypatch):
     assert len(backups) == 1
     assert (backups[0] / "pyproject.toml").read_text(encoding="utf-8") == original
     assert not any(tmp_path.glob(".uv-refresh-tmp-*"))  # temp build dir cleaned up
+
+
+def test_build_adds_without_syncing_and_with_the_projects_uv_config(tmp_path, monkeypatch):
+    # regression tests: 'uv add' used to sync a throwaway venv (every dep
+    # installed, then deleted), and resolved without the project's [tool.uv]
+    # -- constraints/indexes/sources were ignored (both reproduced against
+    # real uv; see test_integration.py for the real-uv side).
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n\n'
+        '[dependency-groups]\ndev = ["pytest>=8"]\n\n'
+        '[tool.uv]\nconstraint-dependencies = ["requests<3"]\n\n'
+        '[tool.ruff]\nline-length = 100\n',
+        encoding="utf-8",
+    )
+    seen = []  # (uv add command, the build pyproject.toml as that command found it)
+
+    def fake_run(cmd, cwd, dry, timeout=None):
+        if cmd[:2] == ["uv", "init"]:
+            (cwd / "pyproject.toml").write_text(
+                '[project]\nname = "demo"\nversion = "0.0.0"\ndependencies = []\n', encoding="utf-8")
+        elif cmd[:2] == ["uv", "add"]:
+            seen.append((cmd, tomllib.loads((cwd / "pyproject.toml").read_text(encoding="utf-8"))))
+
+    monkeypatch.setattr(cli, "run", fake_run)
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes"])
+
+    assert cli.main() == 0
+    assert len(seen) == 2  # main deps + the dev group
+    assert all("--no-sync" in cmd for cmd, _ in seen)
+    build = seen[0][1]
+    assert build["tool"] == {"uv": {"constraint-dependencies": ["requests<3"]}}  # [tool.uv] only
+    assert build["dependency-groups"] == {"dev": []}  # exists before its own 'uv add'
 
 
 def _run_main_full(tmp_path, monkeypatch, requires_python, latest):
@@ -365,6 +411,56 @@ def test_main_rejects_non_string_requires_python_up_front(tmp_path, monkeypatch,
 
     assert exc.value.code == 1
     assert "requires-python must be a string" in capsys.readouterr().err
+    assert not (tmp_path / ".uv-refresh-backup").exists()
+
+
+_HERE = Path(__file__).resolve().parent.as_posix()  # an absolute path on every OS
+_D = '[project]\nname = "d"\n'
+_SOURCES = _D + "[tool.uv.sources]\n"
+
+
+@pytest.mark.parametrize(
+    ("pyproject", "reason"),
+    [
+        (_D + 'dependencies = ["x"]\n', None),
+        (_D + '[tool.uv.workspace]\nmembers = ["libs/*"]\n', "uv workspace"),
+        (_SOURCES + "x = { workspace = true }\n", "workspace source"),
+        (_SOURCES + 'x = { path = "libs/x" }\n', "relative path source"),
+        (_SOURCES + "x = [{ path = '../x', marker = 'sys_platform == \"linux\"' }]\n", "relative path"),
+        (_SOURCES + f'x = {{ path = "{_HERE}" }}\n', None),  # absolute paths work from the temp dir
+        (_SOURCES + 'x = { git = "https://example.com/x.git" }\n', None),
+        (_D + 'dependencies = ["x @ file:///${PROJECT_ROOT}/libs/x"]\n', "${PROJECT_ROOT}"),
+        (_D + '[dependency-groups]\ndev = ["x @ file:///${PROJECT_ROOT}/x"]\n', "${PROJECT_ROOT}"),
+        (_D + 'dynamic = ["version"]\n', "it lists version as dynamic"),
+        (_D + 'dynamic = ["version", "dependencies"]\n', "it lists dependencies, version as dynamic"),
+        (_D + 'dynamic = ["readme"]\n', None),  # uv needs no build for that
+    ],
+)
+def test_unsupported_reason(pyproject, reason):
+    result = cli.unsupported_reason(tomllib.loads(pyproject))
+    if reason is None:
+        assert result is None
+    else:
+        assert result is not None and reason in result
+
+
+def test_main_refuses_what_the_temp_dir_cant_rebuild_before_any_backup(tmp_path, monkeypatch, capsys):
+    # regression test: a dynamic version (setuptools-scm, hatch-vcs, ...) made
+    # the final 'uv lock' build the project in the temp dir, which lacks its
+    # files -- a ModuleNotFoundError from setuptools, after the backup
+    # (reproduced against real uv; so did relative paths/workspaces).
+    pyproject = tmp_path / "pyproject.toml"
+    original = '[project]\nname = "demo"\ndynamic = ["version"]\ndependencies = ["requests>=2.0"]\n'
+    pyproject.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes"])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 1
+    assert "Can't refresh this project: it lists version as dynamic" in capsys.readouterr().err
+    assert pyproject.read_text(encoding="utf-8") == original
     assert not (tmp_path / ".uv-refresh-backup").exists()
 
 
@@ -552,6 +648,19 @@ def test_restrict_to_owner_warns_when_icacls_fails(tmp_path, monkeypatch, capsys
     assert "could not restrict backup permissions" in capsys.readouterr().err
 
 
+def _hanging_run(cmd, **kwargs):
+    raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])  # KeyError if no timeout was set
+
+
+def test_restrict_to_owner_warns_when_icacls_hangs(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(cli.subprocess, "run", _hanging_run)
+
+    cli.restrict_to_owner(tmp_path)
+
+    assert "could not restrict backup permissions" in capsys.readouterr().err
+
+
 def test_latest_installed_python_picks_first_entry(monkeypatch):
     payload = '[{"version": "3.13.5"}, {"version": "3.11.14"}]'
     monkeypatch.setattr(
@@ -585,6 +694,11 @@ def test_latest_installed_python_returns_none_on_failure(monkeypatch):
         cli.subprocess, "run",
         lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1, stdout=""),
     )
+    assert cli.latest_installed_python() is None
+
+
+def test_latest_installed_python_returns_none_on_timeout(monkeypatch):
+    monkeypatch.setattr(cli.subprocess, "run", _hanging_run)
     assert cli.latest_installed_python() is None
 
 

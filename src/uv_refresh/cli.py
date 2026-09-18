@@ -9,7 +9,8 @@ Steps:
      specifiers (extras and environment markers are kept, see --drop-extras)
   2. Back up pyproject.toml + uv.lock into a backup folder
   3. Run uv init --bare + uv add <names> in a temp directory next to the
-     project -- the real pyproject.toml stays untouched the whole time
+     project, with the project's [tool.uv] settings (indexes, sources,
+     constraints) -- the real pyproject.toml stays untouched the whole time
   4. Merge only dependencies/optional-dependencies/dependency-groups from
      the result into a copy of the ORIGINAL pyproject.toml -- everything
      else (description, readme, license, authors, keywords, [project.urls],
@@ -19,6 +20,10 @@ Steps:
 If any step fails -- including Ctrl+C -- the real pyproject.toml was never
 touched, since the whole build happened in the temp directory. The backup
 is kept around as an extra reference regardless.
+
+Projects the temp directory can't rebuild -- uv workspaces, relative path
+sources, a dynamic version or dependencies -- are refused up front, before
+any backup is made.
 
 --full additionally bumps requires-python to the newest installed Python as
 part of step 4, so it's covered by the same atomic swap in step 5, then
@@ -72,6 +77,10 @@ _RELEASE_RE = re.compile(r"\d+(?:\.\d+)*")
 
 C_OK, C_WARN, C_ERR, C_DIM, C_OFF = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
 
+# seconds, for the quick local helper commands ('uv python list', icacls) --
+# --timeout only covers the uv calls that resolve/lock
+_HELPER_TIMEOUT = 60
+
 _quiet = False
 
 
@@ -87,7 +96,10 @@ def say(msg: str, color: str = "") -> None:
         return
     stream = sys.stderr if color in (C_WARN, C_ERR) else sys.stdout
     text = f"{color}{msg}{C_OFF}" if color and _color_enabled(stream) else msg
-    print(text, file=stream)
+    # flush: piped stdout is block-buffered, stderr isn't -- in
+    # 'uv-refresh > log.txt 2>&1' warnings otherwise landed above the status
+    # lines they belong to
+    print(text, file=stream, flush=True)
 
 
 def die(msg: str) -> NoReturn:
@@ -200,13 +212,19 @@ def restrict_to_owner(path: Path) -> None:
         except OSError as e:
             say(f"  could not restrict backup permissions: {e}", C_WARN)
         return
-    result = subprocess.run(
-        ["icacls", str(path), "/inheritance:r", "/grant:r", f"{os.environ.get('USERNAME', '')}:(OI)(CI)F"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
+    try:
+        grant = f"{os.environ.get('USERNAME', '')}:(OI)(CI)F"
+        result = subprocess.run(
+            ["icacls", str(path), "/inheritance:r", "/grant:r", grant],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_HELPER_TIMEOUT,
+        )
+        failed = result.returncode != 0
+    except subprocess.TimeoutExpired:
+        failed = True
+    if failed:
         say(
             f"  could not restrict backup permissions ({path} may be readable "
             "by other local accounts; it may contain credentials)",
@@ -234,24 +252,27 @@ def prune_backups(root: Path, keep: int) -> None:
 
 
 def ensure_backup_ignored(root: Path) -> None:
-    """Traegt '.uv-refresh-backup/' in die .gitignore ein, falls root ein Git-Repo ist.
+    """Traegt '.uv-refresh-backup/' und '.uv-refresh-tmp-*/' in die .gitignore
+    ein, falls root ein Git-Repo ist.
 
     Das Backup kann unveraendert uebernommene Direktquellen enthalten, z. B.
     'pkg @ git+https://user:token@...' (siehe strip_version) -- ohne Eintrag
-    landet das leicht im naechsten 'git add .'.
+    landet das leicht im naechsten 'git add .'. Dasselbe gilt fuer das
+    Temp-Build-Verzeichnis, das nach einem harten Abbruch (kill, Absturz)
+    liegen bleibt, statt aufgeraeumt zu werden.
     """
     if not (root / ".git").is_dir():
         return
-    entry = ".uv-refresh-backup/"
     gitignore = root / ".gitignore"
     text = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
-    if entry in text.splitlines():
+    missing = [e for e in (".uv-refresh-backup/", ".uv-refresh-tmp-*/") if e not in text.splitlines()]
+    if not missing:
         return
     with gitignore.open("a", encoding="utf-8") as f:
         if text and not text.endswith("\n"):
             f.write("\n")
-        f.write(f"{entry}\n")
-    say(f"  added {entry} to .gitignore (backup may contain credentials)", C_WARN)
+        f.writelines(f"{e}\n" for e in missing)
+    say(f"  added {', '.join(missing)} to .gitignore (backup/temp build may contain credentials)", C_WARN)
 
 
 def build_init_cmd(name: str | None, requires_python: str | None, description: str | None) -> list[str]:
@@ -294,12 +315,16 @@ def latest_installed_python() -> str | None:
     a requires-python floor, and an rc someone installed to try out must
     never become the minimum Python of a published package.
     """
-    result = subprocess.run(
-        ["uv", "python", "list", "--only-installed", "--output-format", "json"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["uv", "python", "list", "--only-installed", "--output-format", "json"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_HELPER_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     if result.returncode != 0:
         return None
     try:
@@ -477,6 +502,70 @@ def merge_dependencies(
     return tomlkit.dumps(doc)
 
 
+def seed_build_pyproject(bare_text: str, specs: ProjectSpecs) -> str:
+    """Prepares the bare 'uv init' pyproject.toml in the temp directory for
+    'uv add': carries over the original [tool.uv] table (indexes, sources,
+    constraint/override deps, conflicts, ...) and gives every extra/group an
+    empty list up front, so sources or conflicts that name one still
+    validate before its own 'uv add' has run.
+
+    Without [tool.uv], 'uv add' resolved against plain PyPI: a project with
+    'constraint-dependencies = ["packaging<25"]' got 'packaging>=26.3'
+    written (and the final 'uv lock' then failed), and a path-sourced
+    'mylib' got its bound from an unrelated 'mylib' on PyPI (both reproduced
+    against real uv). Only this temp copy is seeded -- merge_dependencies()
+    still starts from the original text.
+    """
+    doc = tomlkit.parse(bare_text)
+    if specs.tool_uv:
+        doc.setdefault("tool", tomlkit.table(is_super_table=True))["uv"] = specs.tool_uv
+    for name in specs.extras:
+        doc["project"].setdefault("optional-dependencies", tomlkit.table())[name] = []
+    if specs.groups:
+        doc["dependency-groups"] = {name: [] for name in specs.groups}
+    return tomlkit.dumps(doc)
+
+
+# fields uv needs to lock a project -- if any is dynamic, it has to build it
+_DYNAMIC_NEEDS_BUILD = ("dependencies", "optional-dependencies", "requires-python", "version")
+
+
+def unsupported_reason(data: dict) -> str | None:
+    """Why the temp directory can't rebuild this project, or None if it can.
+
+    The temp directory holds only pyproject.toml (+ uv.lock), one level below
+    the project, so relative paths ('path'/workspace sources, workspace
+    members, '${PROJECT_ROOT}' references) resolve to the wrong place, and
+    metadata that only a build can produce (a dynamic version or
+    dependencies) fails for lack of the project's files. All of these used to
+    fail only at the final 'uv lock' -- after the backup, with a uv or
+    build-backend error that didn't say why (each reproduced against real
+    uv). Absolute 'path' sources and a dynamic readme work fine and pass.
+    """
+    project = data.get("project", {})
+    tool_uv = data.get("tool", {}).get("uv", {})
+    if "workspace" in tool_uv:
+        return "it's a uv workspace ([tool.uv.workspace])"
+    for name, source in (tool_uv.get("sources") or {}).items():
+        for entry in source if isinstance(source, list) else [source]:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("workspace"):
+                return f"'{name}' is a workspace source"
+            if "path" in entry and not Path(entry["path"]).is_absolute():
+                return f"'{name}' has a relative path source ({entry['path']!r})"
+    deps = [
+        *project.get("dependencies", []),
+        *(d for ds in (project.get("optional-dependencies") or {}).values() for d in ds),
+        *(d for ds in (data.get("dependency-groups") or {}).values() for d in ds),
+    ]
+    if any(isinstance(d, str) and "${PROJECT_ROOT}" in d for d in deps):
+        return "a dependency points into the project via ${PROJECT_ROOT}"
+    if dynamic := [f for f in _DYNAMIC_NEEDS_BUILD if f in project.get("dynamic", [])]:
+        return f"it lists {', '.join(dynamic)} as dynamic (computed by a build)"
+    return None
+
+
 @dataclass
 class ProjectSpecs:
     """Everything pulled out of the original pyproject.toml that's needed to
@@ -490,6 +579,7 @@ class ProjectSpecs:
     groups: dict[str, list[str]]
     had_groups: bool  # optional-dependencies/dependency-groups existed in the original,
     # independent of --no-groups -- used for the removal warning below
+    tool_uv: dict  # the original [tool.uv] table, see seed_build_pyproject()
 
 
 def load_project_specs(pyproject: Path, args: argparse.Namespace) -> tuple[str, ProjectSpecs]:
@@ -514,6 +604,13 @@ def load_project_specs(pyproject: Path, args: argparse.Namespace) -> tuple[str, 
     requires_python = project.get("requires-python")
     if requires_python is not None and not isinstance(requires_python, str):
         die(f'requires-python must be a string like ">=3.11", not {requires_python!r}')
+
+    if reason := unsupported_reason(data):
+        die(
+            f"Can't refresh this project: {reason}.\n"
+            "  uv-refresh resolves in a temp directory that holds only pyproject.toml -- "
+            "relative paths point elsewhere from there, and build-time metadata needs the project's files."
+        )
 
     keep_extras, keep_markers = not args.drop_extras, not args.drop_markers
     main_deps = specs_from(project.get("dependencies", []), keep_extras, keep_markers)
@@ -543,6 +640,7 @@ def load_project_specs(pyproject: Path, args: argparse.Namespace) -> tuple[str, 
         extras=extras,
         groups=groups,
         had_groups=had_groups,
+        tool_uv=data.get("tool", {}).get("uv", {}),
     )
 
 
@@ -601,7 +699,19 @@ def build_and_swap(
             say("  uv init with --python failed, retrying without it", C_WARN)
             run([f for f in init if not f.startswith("--python=")], build_dir, args.dry_run, args.timeout)
 
+        if args.dry_run:
+            if specs.tool_uv:
+                say("  $ (the project's [tool.uv] settings would now go into the temp pyproject.toml)", C_DIM)
+        elif specs.tool_uv or specs.extras or specs.groups:
+            bare = build_dir / "pyproject.toml"
+            bare.write_text(seed_build_pyproject(bare.read_text(encoding="utf-8"), specs), encoding="utf-8")
+
         # ---- 4. uv add --------------------------------------------------
+        # --no-sync: only the resolved versions matter here. Syncing installed
+        # every dependency into a temp .venv that's deleted right after (GBs
+        # for e.g. torch), and that venv's interpreter then made the final
+        # 'uv lock' reject exact pins like 'requires-python = "==3.14"'.
+        add = ["uv", "add", "--no-sync"]
         flags: list[str] = []
         if args.raw:
             flags.append("--raw")
@@ -609,13 +719,13 @@ def build_and_swap(
             flags += ["--bounds", args.bounds]
 
         if specs.main_deps:
-            run(["uv", "add", *flags, *specs.main_deps], build_dir, args.dry_run, args.timeout)
+            run([*add, *flags, *specs.main_deps], build_dir, args.dry_run, args.timeout)
         for grp, deps in specs.extras.items():
             if deps:
-                run(["uv", "add", "--optional", grp, *flags, *deps], build_dir, args.dry_run, args.timeout)
+                run([*add, "--optional", grp, *flags, *deps], build_dir, args.dry_run, args.timeout)
         for grp, deps in specs.groups.items():
             if deps:
-                run(["uv", "add", "--group", grp, *flags, *deps], build_dir, args.dry_run, args.timeout)
+                run([*add, "--group", grp, *flags, *deps], build_dir, args.dry_run, args.timeout)
 
         # ---- 5. Dependencies in die ORIGINALE pyproject.toml einmergen ----
         if not args.dry_run:

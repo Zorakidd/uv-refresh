@@ -10,7 +10,8 @@ resolved instead of dragging along old version pins.
    entries in `dependency-groups` are resolved, not dropped)
 2. Back up `pyproject.toml` and `uv.lock` into `.uv-refresh-backup/<timestamp>/`
 3. Run `uv init --bare` + `uv add <packages>` in a temp directory next to
-   the project -- the real `pyproject.toml` stays untouched the whole time
+   the project, with the project's `[tool.uv]` settings (indexes, sources,
+   constraints) -- the real `pyproject.toml` stays untouched the whole time
 4. Merge only `dependencies`/`optional-dependencies`/`dependency-groups`
    from the result into a copy of the ORIGINAL `pyproject.toml` -- everything
    else stays untouched
@@ -96,3 +97,22 @@ checked against the *new* `requires-python` -- so jumping to a newer Python
 than the project previously allowed still works. If the pin itself then
 fails, the dependency refresh and `requires-python` bump are kept regardless
 (they already succeeded); only `.python-version` is left as it was.
+
+## Limitations
+
+The temp directory only ever holds `pyproject.toml` (and `uv.lock`), one
+level below the project. So uv-refresh refuses these projects up front,
+before any backup is made, instead of failing halfway with a uv or
+build-backend error:
+
+- uv workspaces (`[tool.uv.workspace]`) and `workspace = true` sources
+- `path` sources with a relative path, and `${PROJECT_ROOT}` references
+  (absolute paths work fine)
+- a dynamic `version`, `dependencies`, `optional-dependencies` or
+  `requires-python` (e.g. setuptools-scm, hatch-vcs), because uv would have to
+  build the project to lock it, and its files aren't in the temp directory
+
+An exact `requires-python = "==3.14"` can make the refresh fail: uv may pick
+a newer 3.14.x interpreter to lock with and then reject it. Plain `uv lock`
+fails the same way on such a project, so that's not something uv-refresh can
+fix.
