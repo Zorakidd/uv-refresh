@@ -61,6 +61,14 @@ except ModuleNotFoundError:  # Fallback, damit das Skript auch nackt laeuft
     Requirement = None
     InvalidRequirement = ValueError  # ty: ignore[invalid-assignment]
 
+# own try block: ty flags the 'Requirement = None' fallback above as soon as
+# a second import shares its try
+try:
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet
+except ModuleNotFoundError:  # dito -- python_allowed() then checks the lower bound only
+    SpecifierSet = None
+    InvalidSpecifier = ValueError  # ty: ignore[invalid-assignment]
+
 _SPEC_RE = re.compile(r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?P<extras>\[[^\]]*\])?")
 _RELEASE_RE = re.compile(r"\d+(?:\.\d+)*")
 _LOWER_BOUND_RE = re.compile(r"^\s*(?P<op>>=|>|~=|===|==)\s*(?P<release>\d+(?:\.\d+)*)")
@@ -345,9 +353,20 @@ def requires_python_lower_bound(requires_python: str | None) -> tuple[tuple[int,
 
 
 def python_allowed(requires_python: str | None, version: str) -> bool:
-    """Whether 'version' clears requires-python's lower bound. Upper bounds
-    are deliberately ignored: whenever 'version' is above the floor, --full
-    replaces the whole specifier with a new floor anyway."""
+    """Whether 'version' satisfies requires-python as it stands -- i.e.
+    whether 'uv python pin <version>' would be accepted against it.
+
+    Upper bounds count too (e.g. an exact '==3.13' with 3.13.5 installed),
+    via packaging's full specifier check. Without packaging, or for a spec it
+    can't parse, only the lower bound is checked -- whatever slips through
+    that way is still refused by 'uv python pin' itself: a reported failure
+    after the rebuild, never a wrong pin.
+    """
+    if not requires_python:
+        return True
+    if SpecifierSet is not None:
+        with contextlib.suppress(InvalidSpecifier):
+            return SpecifierSet(requires_python).contains(version)
     bound = requires_python_lower_bound(requires_python)
     if bound is None:
         return True
@@ -717,31 +736,34 @@ def main() -> int:
                 "leaving requires-python/.python-version unchanged",
                 C_WARN,
             )
-        elif not python_allowed(specs.requires_python, latest):
-            # re-pinning is impossible ('uv python pin' would refuse), and
-            # lowering requires-python to make it fit is not ours to decide
+        elif new_requires_python := bumped_requires_python(specs.requires_python, latest):
+            # the bump replaces the whole specifier, so only the new floor
+            # (which 'latest' satisfies by construction) matters for the pin
+            pin_python = latest
             say(
-                f"  --full: newest installed Python {latest} is older than "
+                f"\n--full: requires-python will be bumped to {new_requires_python} "
+                f"and .python-version re-pinned to {latest}.",
+                C_DIM,
+            )
+        elif python_allowed(specs.requires_python, latest):
+            pin_python = latest
+            say(
+                f"\n--full: requires-python {specs.requires_python} already starts at "
+                f"Python {latest}'s minor version or above, kept as is; "
+                f".python-version will be re-pinned to {latest}.",
+                C_DIM,
+            )
+        else:
+            # requires-python is kept, but excludes 'latest' (older than its
+            # floor, or e.g. an exact '==3.13' with 3.13.5 installed): 'uv
+            # python pin' would refuse, and lowering or loosening
+            # requires-python to make it fit is not ours to decide
+            say(
+                f"  --full: newest installed Python {latest} doesn't satisfy "
                 f"requires-python {specs.requires_python}, "
                 "leaving requires-python/.python-version unchanged",
                 C_WARN,
             )
-        else:
-            pin_python = latest
-            new_requires_python = bumped_requires_python(specs.requires_python, latest)
-            if new_requires_python:
-                say(
-                    f"\n--full: requires-python will be bumped to {new_requires_python} "
-                    f"and .python-version re-pinned to {latest}.",
-                    C_DIM,
-                )
-            else:
-                say(
-                    f"\n--full: requires-python {specs.requires_python} already starts at "
-                    f"Python {latest}'s minor version or above, kept as is; "
-                    f".python-version will be re-pinned to {latest}.",
-                    C_DIM,
-                )
 
     if args.dry_run:
         say("\n--dry-run: from here on, this would happen:", C_DIM)

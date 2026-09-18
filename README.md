@@ -83,8 +83,9 @@ refresh, so it's covered by the same backup/all-or-nothing guarantee.
 
 It only ever goes *up*: pre-release Pythons (e.g. `3.15.0rc2`) are ignored,
 a `requires-python` that already starts at that minor version or above is
-kept as is, and if the newest installed Python is older than
-`requires-python` allows, `--full` leaves both `requires-python` and
+kept as is, and if the newest installed Python doesn't satisfy a kept
+`requires-python` (older than its floor, or e.g. an exact `==3.13` with
+3.13.5 installed), `--full` leaves both `requires-python` and
 `.python-version` alone (with a warning) and just does the normal refresh.
 
 Only once that rebuild has landed does `--full` re-pin `.python-version` via

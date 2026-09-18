@@ -331,7 +331,7 @@ def test_main_full_never_lowers_requires_python(tmp_path, monkeypatch, capsys):
     assert requires_python == ">=3.15"
     assert "--python=>=3.15" in next(c for c in calls if c[:2] == ["uv", "init"])
     assert not any(c[:3] == ["uv", "python", "pin"] for c in calls)
-    assert "older than requires-python >=3.15" in capsys.readouterr().err
+    assert "doesn't satisfy requires-python >=3.15" in capsys.readouterr().err
 
 
 def test_main_full_keeps_requires_python_already_at_that_minor(tmp_path, monkeypatch):
@@ -341,6 +341,29 @@ def test_main_full_keeps_requires_python_already_at_that_minor(tmp_path, monkeyp
 
     assert code == 0
     assert requires_python == ">=3.14.2"
+    assert ["uv", "python", "pin", "3.14.7"] in calls
+
+
+def test_main_full_exact_pin_skips_the_pin_instead_of_failing(tmp_path, monkeypatch, capsys):
+    # regression test: '==3.13' is kept (a '>=3.13' rewrite would loosen
+    # it), but 3.13.5 doesn't satisfy it -- 'uv python pin' would refuse
+    # AFTER a successful rebuild and turn it into exit 1. Skip it up front.
+    code, calls, requires_python = _run_main_full(tmp_path, monkeypatch, "==3.13", "3.13.5")
+
+    assert code == 0
+    assert requires_python == "==3.13"
+    assert not any(c[:3] == ["uv", "python", "pin"] for c in calls)
+    assert "doesn't satisfy requires-python ==3.13" in capsys.readouterr().err
+
+
+def test_main_full_bump_ignores_the_old_upper_bound(tmp_path, monkeypatch):
+    # the bump replaces the whole specifier, so an old '<3.13' cap that
+    # excludes the newest Python must not block it (python_allowed() would
+    # say no to '>=3.10,<3.13' for 3.14.7 -- it's only asked when keeping).
+    code, calls, requires_python = _run_main_full(tmp_path, monkeypatch, ">=3.10,<3.13", "3.14.7")
+
+    assert code == 0
+    assert requires_python == ">=3.14"
     assert ["uv", "python", "pin", "3.14.7"] in calls
 
 
@@ -603,10 +626,28 @@ def test_requires_python_lower_bound(requires_python, expected):
         (">=3.14.2", "3.14.1", False),
         (">3.14", "3.14.0", False),
         (">3.14", "3.14.1", True),
-        (">=3.10,<3.13", "3.14.7", True),  # upper bounds ignored, see python_allowed()
+        (">=3.10,<3.13", "3.14.7", False),
+        ("==3.13", "3.13.5", False),
+        ("==3.13.*", "3.13.5", True),
     ],
 )
 def test_python_allowed(requires_python, version, expected):
+    assert cli.python_allowed(requires_python, version) is expected
+
+
+@pytest.mark.parametrize(
+    ("requires_python", "version", "expected"),
+    [
+        (">=3.15", "3.14.7", False),
+        (">3.14", "3.14.0", False),
+        (">=3.14", "3.14.7", True),
+        ("==3.13", "3.13.5", True),  # upper bounds unchecked -- 'uv python pin' refuses it later
+    ],
+)
+def test_python_allowed_without_packaging_checks_the_lower_bound(
+    monkeypatch, requires_python, version, expected
+):
+    monkeypatch.setattr(cli, "SpecifierSet", None)
     assert cli.python_allowed(requires_python, version) is expected
 
 
