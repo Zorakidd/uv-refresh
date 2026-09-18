@@ -41,6 +41,12 @@ jobs:
           uv version --bump ${{ inputs.bump }}
           echo "version=$(uv version --short)" >> "$GITHUB_OUTPUT"
 
+      - name: Build distribution
+        # Vor dem Push bauen: schlaegt der Build fehl, ist noch nichts gepusht --
+        # sonst stuende ein Tag/Version-Bump ohne PyPI-Release auf GitHub, und
+        # der naechste Lauf wuerde eine Version ueberspringen.
+        run: uv build
+
       - name: Commit, tag, push
         run: |
           git config user.name "github-actions[bot]"
@@ -49,9 +55,6 @@ jobs:
           git commit -m "Release v${{ steps.bump.outputs.version }}"
           git tag "v${{ steps.bump.outputs.version }}"
           git push origin HEAD --tags
-
-      - name: Build distribution
-        run: uv build
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

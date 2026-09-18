@@ -35,3 +35,8 @@ line-length = 110
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "UP", "SIM", "C4", "I"]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: runs the real uv CLI (needs uv on PATH and network access to PyPI); skip with -m 'not integration'",
+]

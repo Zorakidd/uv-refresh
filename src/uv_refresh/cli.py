@@ -9,10 +9,9 @@ Steps:
      specifiers (extras and environment markers are kept, see --drop-extras)
   2. Back up pyproject.toml + uv.lock into a backup folder
   3. Run uv init --bare + uv add <names> in a temp directory next to the
-     project -- the real pyproject.toml stays untouched the whole time.
-     .python-version and [tool.uv.sources]/[tool.uv.index] (if present) are
-     copied into that temp directory first, so resolution happens against the
-     same interpreter and package indexes the real project actually uses
+     project, with the project's [tool.uv] settings (indexes, sources,
+     constraints) and .python-version -- the real pyproject.toml stays
+     untouched the whole time
   4. Merge only dependencies/optional-dependencies/dependency-groups from
      the result into a copy of the ORIGINAL pyproject.toml -- everything
      else (description, readme, license, authors, keywords, [project.urls],
@@ -23,9 +22,14 @@ If any step fails -- including Ctrl+C -- the real pyproject.toml was never
 touched, since the whole build happened in the temp directory. The backup
 is kept around as an extra reference regardless.
 
+Projects the temp directory can't rebuild -- uv workspaces, relative path
+sources, a dynamic version or dependencies -- are refused up front, before
+any backup is made.
+
 --full additionally bumps requires-python to the newest installed Python as
-part of step 4 (so it's covered by the same atomic swap in step 5), then
-re-pins .python-version to match once that swap has landed.
+part of step 4, so it's covered by the same atomic swap in step 5, then
+re-pins .python-version to match once that swap has landed. It only ever
+raises requires-python, and ignores pre-release Pythons.
 
 Usage:
   uv-refresh                 # in the project directory, asks for confirmation
@@ -63,9 +67,20 @@ except ModuleNotFoundError:  # Fallback, damit das Skript auch nackt laeuft
     Requirement = None
     InvalidRequirement = ValueError  # ty: ignore[invalid-assignment]
 
+try:  # --full's requires-python handling; without packaging, plan_full() skips it
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet
+    from packaging.version import InvalidVersion, Version
+except ModuleNotFoundError:
+    SpecifierSet = None  # ty: ignore[invalid-assignment]
+
 _SPEC_RE = re.compile(r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?P<extras>\[[^\]]*\])?")
+_RELEASE_RE = re.compile(r"\d+(?:\.\d+)*")
 
 C_OK, C_WARN, C_ERR, C_DIM, C_OFF = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
+
+# seconds, for the quick local helper commands ('uv python list', icacls) --
+# --timeout only covers the uv calls that resolve/lock
+_HELPER_TIMEOUT = 60
 
 _quiet = False
 
@@ -82,7 +97,10 @@ def say(msg: str, color: str = "") -> None:
         return
     stream = sys.stderr if color in (C_WARN, C_ERR) else sys.stdout
     text = f"{color}{msg}{C_OFF}" if color and _color_enabled(stream) else msg
-    print(text, file=stream)
+    # flush: piped stdout is block-buffered, stderr isn't -- in
+    # 'uv-refresh > log.txt 2>&1' warnings otherwise landed above the status
+    # lines they belong to
+    print(text, file=stream, flush=True)
 
 
 def die(msg: str) -> NoReturn:
@@ -195,13 +213,19 @@ def restrict_to_owner(path: Path) -> None:
         except OSError as e:
             say(f"  could not restrict backup permissions: {e}", C_WARN)
         return
-    result = subprocess.run(
-        ["icacls", str(path), "/inheritance:r", "/grant:r", f"{os.environ.get('USERNAME', '')}:(OI)(CI)F"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
+    try:
+        grant = f"{os.environ.get('USERNAME', '')}:(OI)(CI)F"
+        result = subprocess.run(
+            ["icacls", str(path), "/inheritance:r", "/grant:r", grant],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_HELPER_TIMEOUT,
+        )
+        failed = result.returncode != 0
+    except subprocess.TimeoutExpired:
+        failed = True
+    if failed:
         say(
             f"  could not restrict backup permissions ({path} may be readable "
             "by other local accounts; it may contain credentials)",
@@ -229,24 +253,27 @@ def prune_backups(root: Path, keep: int) -> None:
 
 
 def ensure_backup_ignored(root: Path) -> None:
-    """Traegt '.uv-refresh-backup/' in die .gitignore ein, falls root ein Git-Repo ist.
+    """Traegt '.uv-refresh-backup/' und '.uv-refresh-tmp-*/' in die .gitignore
+    ein, falls root ein Git-Repo ist.
 
     Das Backup kann unveraendert uebernommene Direktquellen enthalten, z. B.
     'pkg @ git+https://user:token@...' (siehe strip_version) -- ohne Eintrag
-    landet das leicht im naechsten 'git add .'.
+    landet das leicht im naechsten 'git add .'. Dasselbe gilt fuer das
+    Temp-Build-Verzeichnis, das nach einem harten Abbruch (kill, Absturz)
+    liegen bleibt, statt aufgeraeumt zu werden.
     """
     if not (root / ".git").is_dir():
         return
-    entry = ".uv-refresh-backup/"
     gitignore = root / ".gitignore"
     text = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
-    if entry in text.splitlines():
+    missing = [e for e in (".uv-refresh-backup/", ".uv-refresh-tmp-*/") if e not in text.splitlines()]
+    if not missing:
         return
     with gitignore.open("a", encoding="utf-8") as f:
         if text and not text.endswith("\n"):
             f.write("\n")
-        f.write(f"{entry}\n")
-    say(f"  added {entry} to .gitignore (backup may contain credentials)", C_WARN)
+        f.writelines(f"{e}\n" for e in missing)
+    say(f"  added {', '.join(missing)} to .gitignore (backup/temp build may contain credentials)", C_WARN)
 
 
 def build_init_cmd(name: str | None, requires_python: str | None, description: str | None) -> list[str]:
@@ -279,25 +306,34 @@ def run(cmd: list[str], cwd: Path, dry: bool, timeout: float | None = None) -> N
 
 
 def latest_installed_python() -> str | None:
-    """Newest Python version 'uv python list' can find already installed
-    (uv-managed or otherwise) -- the list comes back newest first, so the
-    first entry is it. Deliberately --only-installed: --full re-pins to
-    what's already there, it should never trigger a Python download on its
-    own just to figure out what the newest version would be.
+    """Newest stable Python version 'uv python list' can find already
+    installed (uv-managed or otherwise) -- the list comes back newest first.
+    Deliberately --only-installed: --full re-pins to what's already there,
+    it should never trigger a Python download on its own just to figure out
+    what the newest version would be.
+
+    Pre-releases like '3.15.0rc2' are skipped: --full turns this version into
+    a requires-python floor, and an rc someone installed to try out must
+    never become the minimum Python of a published package.
     """
-    result = subprocess.run(
-        ["uv", "python", "list", "--only-installed", "--output-format", "json"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["uv", "python", "list", "--only-installed", "--output-format", "json"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_HELPER_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     if result.returncode != 0:
         return None
     try:
         installs = json.loads(result.stdout)
     except json.JSONDecodeError:
         return None
-    return installs[0]["version"] if installs else None
+    stable = [i["version"] for i in installs if _RELEASE_RE.fullmatch(i["version"])]
+    return stable[0] if stable else None
 
 
 def requires_python_floor(version: str) -> str:
@@ -310,17 +346,97 @@ def requires_python_floor(version: str) -> str:
     return f">={major_minor}"
 
 
+def _lower_bound(spec: SpecifierSet) -> Version | None:
+    """The highest version 'spec' puts a floor at -- '>=3.11', '>3.11',
+    '~=3.11' and '==3.11.*' all floor at 3.11. None if it has no floor at
+    all (empty, or only '<'/'!=' clauses)."""
+    bounds = []
+    for s in spec:
+        if s.operator in (">=", ">", "~=", "==", "==="):
+            with contextlib.suppress(InvalidVersion):  # '===' may hold any string
+                bounds.append(Version(s.version.removesuffix(".*")))
+    return max(bounds, default=None)
+
+
+def bumped_requires_python(current: SpecifierSet, version: str) -> str | None:
+    """--full: the requires-python to write for 'version' -- its major.minor
+    floor (see requires_python_floor), but only if that's actually HIGHER
+    than the current floor. None means keep requires-python as it is:
+    writing the floor anyway could LOWER it, e.g. '>=3.15' -> '>=3.14' on a
+    machine whose newest Python happens to be 3.14 -- silently widening what
+    the project claims to support.
+    """
+    floor = requires_python_floor(version)
+    bound = _lower_bound(current)
+    if bound is not None and Version(floor.removeprefix(">=")) <= bound:
+        return None
+    return floor
+
+
+def plan_full(requires_python: str | None) -> tuple[str | None, str | None]:
+    """--full, decided once before anything is touched: returns (the new
+    requires-python, or None to keep it; the version to re-pin
+    .python-version to, or None to leave it), and says which it is.
+
+    A requires-python this can't evaluate -- invalid, or packaging missing
+    (see the import at the top) -- is left alone rather than guessed at.
+    """
+    unchanged = "leaving requires-python/.python-version unchanged"
+    if SpecifierSet is None:
+        say(f"\n--full: needs the 'packaging' module (a uv-refresh dependency), {unchanged}", C_WARN)
+        return None, None
+    latest = latest_installed_python()
+    if latest is None:
+        say(
+            f"\n--full: no installed Python found (uv python list, pre-releases skipped), {unchanged}",
+            C_WARN,
+        )
+        return None, None
+    try:
+        current = SpecifierSet(requires_python or "")
+    except InvalidSpecifier:
+        say(f"\n--full: can't parse requires-python {requires_python!r}, {unchanged}", C_WARN)
+        return None, None
+
+    if new := bumped_requires_python(current, latest):
+        # the bump replaces the whole specifier, so only the new floor
+        # (which 'latest' satisfies by construction) matters for the pin
+        say(
+            f"\n--full: requires-python will be bumped to {new} and .python-version re-pinned to {latest}.",
+            C_DIM,
+        )
+        return new, latest
+    if latest in current:
+        say(
+            f"\n--full: requires-python {requires_python} already starts at Python {latest}'s minor "
+            f"version or above, kept as is; .python-version will be re-pinned to {latest}.",
+            C_DIM,
+        )
+        return None, latest
+    # requires-python is kept, but excludes 'latest' (older than its floor,
+    # or e.g. an exact '==3.13' with 3.13.5 installed): 'uv python pin' would
+    # refuse, and lowering or loosening requires-python to make it fit is
+    # not ours to decide
+    say(
+        f"\n--full: newest installed Python {latest} doesn't satisfy requires-python "
+        f"{requires_python}, {unchanged}",
+        C_WARN,
+    )
+    return None, None
+
+
 def refresh_python_version(root: Path, dry: bool, version: str) -> None:
     """--full: drops whatever .python-version currently pins and re-pins the
-    project to 'version' (the newest installed Python -- main() already
-    looked it up and used it to bump requires-python in the same rebuild).
+    project to 'version' (the newest installed Python -- plan_full() already
+    looked it up, checked requires-python allows it, and bumped
+    requires-python in the same rebuild where that was needed).
 
     No separate delete step: 'uv python pin' overwrites an existing pin (or
     creates a fresh one) directly, and -- crucially -- refuses to write
     anything at all if the target version doesn't satisfy requires-python.
 
-    Runs AFTER build_and_swap(), not before: requires-python is bumped as
-    part of that same atomic pyproject.toml rebuild, so requires-python
+    Runs AFTER build_and_swap(), not before: requires-python is bumped (if
+    needed) as part of that same atomic pyproject.toml rebuild, so it
     already allows 'version' by the time this pin runs. Pinning first (the
     old order) would fail here whenever --full jumps to a Python newer than
     the OLD requires-python permitted -- exactly the case --full is for.
@@ -328,7 +444,7 @@ def refresh_python_version(root: Path, dry: bool, version: str) -> None:
     run(["uv", "python", "pin", version], root, dry)
 
 
-def pin_build_interpreter(build_dir: Path, root: Path, latest_python: str | None) -> None:
+def pin_build_interpreter(build_dir: Path, root: Path, pin_python: str | None) -> None:
     """Pins the temp build to whichever interpreter 'uv add' should actually
     resolve/install against, instead of whatever's newest installed.
 
@@ -341,12 +457,12 @@ def pin_build_interpreter(build_dir: Path, root: Path, latest_python: str | None
     (e.g. torch) has no wheel for that newer version, 'uv add' fails here
     even though the real project works fine on its actual pinned interpreter.
 
-    --full is the exception: it's deliberately moving the project to
-    latest_python (already looked up by main()), so the temp build should
-    resolve against THAT version, not the old pin it's about to replace.
+    --full is the exception: when plan_full() decided to re-pin the project
+    to pin_python, the temp build should resolve against THAT version, not
+    the old pin it's about to replace.
     """
-    if latest_python:
-        version = latest_python
+    if pin_python:
+        version = pin_python
     else:
         existing = root / ".python-version"
         if not existing.is_file():
@@ -355,34 +471,6 @@ def pin_build_interpreter(build_dir: Path, root: Path, latest_python: str | None
         if not version:
             return
     (build_dir / ".python-version").write_text(version + "\n", encoding="utf-8")
-
-
-def copy_tool_uv_sources(build_dir: Path, original_text: str) -> None:
-    """Carries [tool.uv.sources] / [tool.uv.index] over into the freshly
-    uv-init'd temp pyproject.toml, before 'uv add' runs there.
-
-    merge_dependencies() already leaves these two untouched in the FINAL
-    pyproject.toml (they live under [tool], which it never edits) -- but the
-    temp 'uv add' below runs against a bare pyproject.toml from 'uv init'
-    that doesn't have them yet. Without this, a package pinned to an
-    explicit/custom index (e.g. PyTorch's CUDA wheel index) gets re-resolved
-    against plain PyPI instead during the temp build -- silently landing on a
-    different distribution (or one with no wheel at all for the interpreter
-    in use) instead of the one the real project actually uses.
-    """
-    orig_tool_uv = tomllib.loads(original_text).get("tool", {}).get("uv", {})
-    sources = orig_tool_uv.get("sources")
-    index = orig_tool_uv.get("index")
-    if not sources and not index:
-        return
-    temp_path = build_dir / "pyproject.toml"
-    doc = tomlkit.parse(temp_path.read_text(encoding="utf-8"))
-    uv_table = doc.setdefault("tool", tomlkit.table()).setdefault("uv", tomlkit.table())
-    if sources:
-        uv_table["sources"] = sources
-    if index:
-        uv_table["index"] = index
-    temp_path.write_text(tomlkit.dumps(doc), encoding="utf-8")
 
 
 def _toml_array(values: list[str]):
@@ -444,6 +532,70 @@ def merge_dependencies(
     return tomlkit.dumps(doc)
 
 
+def seed_build_pyproject(bare_text: str, specs: ProjectSpecs) -> str:
+    """Prepares the bare 'uv init' pyproject.toml in the temp directory for
+    'uv add': carries over the original [tool.uv] table (indexes, sources,
+    constraint/override deps, conflicts, ...) and gives every extra/group an
+    empty list up front, so sources or conflicts that name one still
+    validate before its own 'uv add' has run.
+
+    Without [tool.uv], 'uv add' resolved against plain PyPI: a project with
+    'constraint-dependencies = ["packaging<25"]' got 'packaging>=26.3'
+    written (and the final 'uv lock' then failed), and a path-sourced
+    'mylib' got its bound from an unrelated 'mylib' on PyPI (both reproduced
+    against real uv). Only this temp copy is seeded -- merge_dependencies()
+    still starts from the original text.
+    """
+    doc = tomlkit.parse(bare_text)
+    if specs.tool_uv:
+        doc.setdefault("tool", tomlkit.table(is_super_table=True))["uv"] = specs.tool_uv
+    for name in specs.extras:
+        doc["project"].setdefault("optional-dependencies", tomlkit.table())[name] = []
+    if specs.groups:
+        doc["dependency-groups"] = {name: [] for name in specs.groups}
+    return tomlkit.dumps(doc)
+
+
+# fields uv needs to lock a project -- if any is dynamic, it has to build it
+_DYNAMIC_NEEDS_BUILD = ("dependencies", "optional-dependencies", "requires-python", "version")
+
+
+def unsupported_reason(data: dict) -> str | None:
+    """Why the temp directory can't rebuild this project, or None if it can.
+
+    The temp directory holds only pyproject.toml (+ uv.lock), one level below
+    the project, so relative paths ('path'/workspace sources, workspace
+    members, '${PROJECT_ROOT}' references) resolve to the wrong place, and
+    metadata that only a build can produce (a dynamic version or
+    dependencies) fails for lack of the project's files. All of these used to
+    fail only at the final 'uv lock' -- after the backup, with a uv or
+    build-backend error that didn't say why (each reproduced against real
+    uv). Absolute 'path' sources and a dynamic readme work fine and pass.
+    """
+    project = data.get("project", {})
+    tool_uv = data.get("tool", {}).get("uv", {})
+    if "workspace" in tool_uv:
+        return "it's a uv workspace ([tool.uv.workspace])"
+    for name, source in (tool_uv.get("sources") or {}).items():
+        for entry in source if isinstance(source, list) else [source]:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("workspace"):
+                return f"'{name}' is a workspace source"
+            if "path" in entry and not Path(entry["path"]).is_absolute():
+                return f"'{name}' has a relative path source ({entry['path']!r})"
+    deps = [
+        *project.get("dependencies", []),
+        *(d for ds in (project.get("optional-dependencies") or {}).values() for d in ds),
+        *(d for ds in (data.get("dependency-groups") or {}).values() for d in ds),
+    ]
+    if any(isinstance(d, str) and "${PROJECT_ROOT}" in d for d in deps):
+        return "a dependency points into the project via ${PROJECT_ROOT}"
+    if dynamic := [f for f in _DYNAMIC_NEEDS_BUILD if f in project.get("dynamic", [])]:
+        return f"it lists {', '.join(dynamic)} as dynamic (computed by a build)"
+    return None
+
+
 @dataclass
 class ProjectSpecs:
     """Everything pulled out of the original pyproject.toml that's needed to
@@ -457,6 +609,7 @@ class ProjectSpecs:
     groups: dict[str, list[str]]
     had_groups: bool  # optional-dependencies/dependency-groups existed in the original,
     # independent of --no-groups -- used for the removal warning below
+    tool_uv: dict  # the original [tool.uv] table, see seed_build_pyproject()
 
 
 def load_project_specs(pyproject: Path, args: argparse.Namespace) -> tuple[str, ProjectSpecs]:
@@ -474,6 +627,20 @@ def load_project_specs(pyproject: Path, args: argparse.Namespace) -> tuple[str, 
     project = data.get("project", {})
     if not project:
         die("No [project] section found. Is this a uv/PEP 621 project?")
+
+    # e.g. 'requires-python = 3.11' (a TOML float): uv rejects the project
+    # anyway, and --full's specifier helpers would crash on it -- say so up
+    # front instead, before any backup is made
+    requires_python = project.get("requires-python")
+    if requires_python is not None and not isinstance(requires_python, str):
+        die(f'requires-python must be a string like ">=3.11", not {requires_python!r}')
+
+    if reason := unsupported_reason(data):
+        die(
+            f"Can't refresh this project: {reason}.\n"
+            "  uv-refresh resolves in a temp directory that holds only pyproject.toml -- "
+            "relative paths point elsewhere from there, and build-time metadata needs the project's files."
+        )
 
     keep_extras, keep_markers = not args.drop_extras, not args.drop_markers
     main_deps = specs_from(project.get("dependencies", []), keep_extras, keep_markers)
@@ -497,12 +664,13 @@ def load_project_specs(pyproject: Path, args: argparse.Namespace) -> tuple[str, 
 
     return original_text, ProjectSpecs(
         name=project.get("name"),
-        requires_python=project.get("requires-python"),
+        requires_python=requires_python,
         description=project.get("description"),
         main_deps=main_deps,
         extras=extras,
         groups=groups,
         had_groups=had_groups,
+        tool_uv=data.get("tool", {}).get("uv", {}),
     )
 
 
@@ -514,7 +682,8 @@ def build_and_swap(
     original_text: str,
     specs: ProjectSpecs,
     args: argparse.Namespace,
-    latest_python: str | None = None,
+    new_requires_python: str | None = None,
+    pin_python: str | None = None,
 ) -> None:
     """Runs steps 2-6: backup, 'uv init' + 'uv add' in a temp directory, merge
     the freshly resolved dependencies into a copy of the ORIGINAL
@@ -524,11 +693,13 @@ def build_and_swap(
     if this raises (including on KeyboardInterrupt), they are guaranteed
     unchanged -- 'backup' is kept regardless, as an extra safety net.
 
-    latest_python is only set when --full found an installed Python (main()
-    looked it up); when set, requires-python is bumped to match it as part
-    of this same atomic rebuild, and 'uv init' below targets it too --
-    main() re-pins .python-version to it afterwards, once requires-python
-    already allows that pin.
+    new_requires_python is only set when --full decided requires-python has
+    to go up (see plan_full()); it's then written as
+    part of this same atomic rebuild, and 'uv init' below targets it too --
+    main() re-pins .python-version afterwards, once requires-python already
+    allows that pin. pin_python (also from plan_full()) is the version that
+    pin will use; the temp build already resolves against it, see
+    pin_build_interpreter().
     """
     build_ctx = (
         tempfile.TemporaryDirectory(dir=root, prefix=".uv-refresh-tmp-")
@@ -551,7 +722,6 @@ def build_and_swap(
             shutil.copy2(lock, build_dir / "uv.lock")
 
         # ---- 3. uv init -----------------------------------------------
-        new_requires_python = requires_python_floor(latest_python) if latest_python else None
         init_python = new_requires_python or specs.requires_python
         init = build_init_cmd(specs.name, init_python, specs.description)
         try:
@@ -562,11 +732,22 @@ def build_and_swap(
             say("  uv init with --python failed, retrying without it", C_WARN)
             run([f for f in init if not f.startswith("--python=")], build_dir, args.dry_run, args.timeout)
 
-        if not args.dry_run:
-            pin_build_interpreter(build_dir, root, latest_python)
-            copy_tool_uv_sources(build_dir, original_text)
+        if args.dry_run:
+            if specs.tool_uv:
+                say("  $ (the project's [tool.uv] settings would now go into the temp pyproject.toml)", C_DIM)
+        else:
+            pin_build_interpreter(build_dir, root, pin_python)
+            if specs.tool_uv or specs.extras or specs.groups:
+                bare = build_dir / "pyproject.toml"
+                seeded = seed_build_pyproject(bare.read_text(encoding="utf-8"), specs)
+                bare.write_text(seeded, encoding="utf-8")
 
         # ---- 4. uv add --------------------------------------------------
+        # --no-sync: only the resolved versions matter here. Syncing installed
+        # every dependency into a temp .venv that's deleted right after (GBs
+        # for e.g. torch), and that venv's interpreter then made the final
+        # 'uv lock' reject exact pins like 'requires-python = "==3.14"'.
+        add = ["uv", "add", "--no-sync"]
         flags: list[str] = []
         if args.raw:
             flags.append("--raw")
@@ -574,13 +755,13 @@ def build_and_swap(
             flags += ["--bounds", args.bounds]
 
         if specs.main_deps:
-            run(["uv", "add", *flags, *specs.main_deps], build_dir, args.dry_run, args.timeout)
+            run([*add, *flags, *specs.main_deps], build_dir, args.dry_run, args.timeout)
         for grp, deps in specs.extras.items():
             if deps:
-                run(["uv", "add", "--optional", grp, *flags, *deps], build_dir, args.dry_run, args.timeout)
+                run([*add, "--optional", grp, *flags, *deps], build_dir, args.dry_run, args.timeout)
         for grp, deps in specs.groups.items():
             if deps:
-                run(["uv", "add", "--group", grp, *flags, *deps], build_dir, args.dry_run, args.timeout)
+                run([*add, "--group", grp, *flags, *deps], build_dir, args.dry_run, args.timeout)
 
         # ---- 5. Dependencies in die ORIGINALE pyproject.toml einmergen ----
         if not args.dry_run:
@@ -702,31 +883,17 @@ def main() -> int:
             C_WARN,
         )
 
-    # latest_python is looked up here (read-only 'uv python list') rather than
-    # inside build_and_swap(): main() needs it already for the dry-run/confirm
-    # messages below, and build_and_swap() needs that SAME value for the
-    # requires-python bump -- a second lookup there could return something
+    # --full is decided once, here (read-only 'uv python list') rather than
+    # inside build_and_swap(): the dry-run/confirm messages below need it
+    # already, and the requires-python bump and the pin after the swap must
+    # both use the SAME lookup -- a second one could return something
     # different (e.g. a Python installed in between).
-    latest_python: str | None = None
-    if args.full:
-        latest_python = latest_installed_python()
-        if latest_python is None:
-            say(
-                "  --full: no installed Python found (uv python list), "
-                "leaving requires-python/.python-version unchanged",
-                C_WARN,
-            )
-        else:
-            say(
-                f"\n--full: requires-python will be bumped to {requires_python_floor(latest_python)} "
-                f"and .python-version re-pinned to {latest_python}.",
-                C_DIM,
-            )
+    new_requires_python, pin_python = plan_full(specs.requires_python) if args.full else (None, None)
 
     if args.dry_run:
         say("\n--dry-run: from here on, this would happen:", C_DIM)
     elif not args.yes:
-        prompt = "Rebuild pyproject.toml (and re-pin Python) now? [Y/N] " if args.full \
+        prompt = "Rebuild pyproject.toml (and re-pin Python) now? [Y/N] " if pin_python \
             else "Rebuild pyproject.toml now? [Y/N] "
         try:
             answer = input(f"\n{prompt}").strip().lower()
@@ -746,7 +913,9 @@ def main() -> int:
     )
 
     try:
-        build_and_swap(root, pyproject, lock, backup, original_text, specs, args, latest_python)
+        build_and_swap(
+            root, pyproject, lock, backup, original_text, specs, args, new_requires_python, pin_python
+        )
     except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 -- Notbremse: bei
         # JEDEM Fehler (uv, Dateisystem, Interrupt, ...) klar melden. Der Aufbau
         # geschah in einem Temp-Verzeichnis, root ist daher normalerweise
@@ -756,14 +925,15 @@ def main() -> int:
             say(f"pyproject.toml unchanged. Backup is at {backup}.", C_WARN)
         return 1
 
-    # ---- 3. .python-version -------------------------------------------------
-    # Only after the atomic swap above: requires-python in the real
-    # pyproject.toml is already bumped to latest_python by now, so 'uv python
-    # pin' passes its own requires-python check instead of failing against
-    # the OLD (pre-swap) constraint.
-    if args.full and latest_python:
+    # ---- 7. .python-version ------------------------------------------------
+    # (steps 2-6 are build_and_swap's) Only after the atomic swap above: if
+    # requires-python had to go up to allow pin_python, the real
+    # pyproject.toml has that bump by now, so 'uv python pin' passes its own
+    # requires-python check instead of failing against the OLD (pre-swap)
+    # constraint.
+    if pin_python:
         try:
-            refresh_python_version(root, args.dry_run, latest_python)
+            refresh_python_version(root, args.dry_run, pin_python)
         except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 -- siehe oben:
             # pyproject.toml/uv.lock were already swapped successfully above;
             # only the .python-version pin itself failed here.
