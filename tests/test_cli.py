@@ -4,6 +4,7 @@ import sys
 import tomllib
 
 import pytest
+from packaging.specifiers import SpecifierSet
 
 from uv_refresh import cli
 
@@ -256,46 +257,6 @@ def test_main_success_swaps_pyproject_and_lock(tmp_path, monkeypatch):
     assert not any(tmp_path.glob(".uv-refresh-tmp-*"))  # temp build dir cleaned up
 
 
-def test_main_full_bumps_requires_python_and_pins_python(tmp_path, monkeypatch):
-    # end-to-end through main(): --full should (a) tell 'uv init' to target
-    # the newest installed Python, (b) end up with that same floor written to
-    # requires-python in the real pyproject.toml, and (c) pin .python-version
-    # to it once the swap has landed.
-    pyproject = tmp_path / "pyproject.toml"
-    original = (
-        '[project]\nname = "demo"\nversion = "1.0.0"\nrequires-python = ">=3.9"\n'
-        'dependencies = ["requests>=2.0"]\n'
-    )
-    pyproject.write_text(original, encoding="utf-8")
-
-    all_cmds = []
-
-    def fake_run(cmd, cwd, dry, timeout=None):
-        all_cmds.append(cmd)
-        if cmd[:2] == ["uv", "init"]:
-            (cwd / "pyproject.toml").write_text(
-                '[project]\nname = "demo"\nversion = "0.0.0"\n', encoding="utf-8")
-        elif cmd[:2] == ["uv", "add"]:
-            (cwd / "pyproject.toml").write_text(
-                '[project]\nname = "demo"\nversion = "0.0.0"\n'
-                'dependencies = ["requests==2.31.0"]\n', encoding="utf-8")
-
-    monkeypatch.setattr(cli, "run", fake_run)
-    monkeypatch.setattr(cli, "latest_installed_python", lambda: "3.14.0")
-    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
-    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes", "--full"])
-
-    assert cli.main() == 0
-
-    init_cmd = next(c for c in all_cmds if c[:2] == ["uv", "init"])
-    assert "--python=>=3.14" in init_cmd
-    assert ["uv", "python", "pin", "3.14.0"] in all_cmds
-
-    result = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    assert result["project"]["requires-python"] == ">=3.14"
-    assert result["project"]["dependencies"] == ["requests==2.31.0"]
-
-
 def _run_main_full(tmp_path, monkeypatch, requires_python, latest):
     """main() --full --yes on a project with the given requires-python, with
     'latest' as the newest installed Python; returns (exit code, uv commands
@@ -317,6 +278,21 @@ def _run_main_full(tmp_path, monkeypatch, requires_python, latest):
     code = cli.main()
     result = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     return code, calls, result["project"]["requires-python"]
+
+
+def test_main_full_bumps_requires_python_and_pins_python(tmp_path, monkeypatch):
+    # end-to-end through main(): --full should (a) tell 'uv init' to target
+    # the newest installed Python, (b) end up with that same floor written to
+    # requires-python in the real pyproject.toml, and (c) pin .python-version
+    # to it once the swap has landed.
+    code, calls, requires_python = _run_main_full(tmp_path, monkeypatch, ">=3.9", "3.14.0")
+
+    assert code == 0
+    assert "--python=>=3.14" in next(c for c in calls if c[:2] == ["uv", "init"])
+    assert ["uv", "python", "pin", "3.14.0"] in calls
+    assert requires_python == ">=3.14"
+    result = tomllib.loads((tmp_path / "pyproject.toml").read_text(encoding="utf-8"))
+    assert result["project"]["dependencies"] == ["requests==2.31.0"]
 
 
 def test_main_full_never_lowers_requires_python(tmp_path, monkeypatch, capsys):
@@ -359,8 +335,8 @@ def test_main_full_exact_pin_skips_the_pin_instead_of_failing(tmp_path, monkeypa
 
 def test_main_full_bump_ignores_the_old_upper_bound(tmp_path, monkeypatch):
     # the bump replaces the whole specifier, so an old '<3.13' cap that
-    # excludes the newest Python must not block it (python_allowed() would
-    # say no to '>=3.10,<3.13' for 3.14.7 -- it's only asked when keeping).
+    # excludes the newest Python must not block it (plan_full() only checks
+    # 'latest in requires-python' when requires-python is KEPT).
     code, calls, requires_python = _run_main_full(tmp_path, monkeypatch, ">=3.10,<3.13", "3.14.7")
 
     assert code == 0
@@ -625,72 +601,55 @@ def test_requires_python_floor_truncates_to_major_minor():
 
 
 @pytest.mark.parametrize(
-    ("requires_python", "expected"),
-    [
-        (None, None),
-        ("<3.13", None),
-        (">=3.11", ((3, 11), True)),
-        (">= 3.11, <4", ((3, 11), True)),
-        (">3.12", ((3, 12), False)),
-        ("~=3.12", ((3, 12), True)),
-        ("==3.12.*", ((3, 12), True)),
-        (">=3.12.0", ((3, 12), True)),
-        (">=3.10,>=3.12.1", ((3, 12, 1), True)),
-        (">=3.12,>3.12", ((3, 12), False)),
-    ],
-)
-def test_requires_python_lower_bound(requires_python, expected):
-    assert cli.requires_python_lower_bound(requires_python) == expected
-
-
-@pytest.mark.parametrize(
-    ("requires_python", "version", "expected"),
-    [
-        (None, "3.14.7", True),
-        (">=3.14", "3.14.0", True),
-        (">=3.15", "3.14.7", False),
-        (">=3.14.2", "3.14.1", False),
-        (">3.14", "3.14.0", False),
-        (">3.14", "3.14.1", True),
-        (">=3.10,<3.13", "3.14.7", False),
-        ("==3.13", "3.13.5", False),
-        ("==3.13.*", "3.13.5", True),
-    ],
-)
-def test_python_allowed(requires_python, version, expected):
-    assert cli.python_allowed(requires_python, version) is expected
-
-
-@pytest.mark.parametrize(
-    ("requires_python", "version", "expected"),
-    [
-        (">=3.15", "3.14.7", False),
-        (">3.14", "3.14.0", False),
-        (">=3.14", "3.14.7", True),
-        ("==3.13", "3.13.5", True),  # upper bounds unchecked -- 'uv python pin' refuses it later
-    ],
-)
-def test_python_allowed_without_packaging_checks_the_lower_bound(
-    monkeypatch, requires_python, version, expected
-):
-    monkeypatch.setattr(cli, "SpecifierSet", None)
-    assert cli.python_allowed(requires_python, version) is expected
-
-
-@pytest.mark.parametrize(
     ("requires_python", "version", "expected"),
     [
         (">=3.11", "3.14.7", ">=3.14"),
-        (None, "3.14.7", ">=3.14"),
+        ("", "3.14.7", ">=3.14"),
+        ("<3.13", "3.14.7", ">=3.14"),         # no floor at all
         (">=3.10,<3.13", "3.14.7", ">=3.14"),
-        (">=3.14", "3.14.7", None),     # already there -- no churn
-        (">=3.14.2", "3.14.7", None),   # '>=3.14' would loosen it
-        (">3.14", "3.14.7", None),      # same
-        (">=3.15", "3.14.7", None),     # would LOWER it
+        (">=3.14", "3.14.7", None),            # already there -- no churn
+        (">=3.14.0", "3.14.7", None),          # same (3.14.0 == 3.14)
+        (">=3.14.2", "3.14.7", None),          # '>=3.14' would loosen it
+        (">3.14", "3.14.7", None),             # same
+        ("~=3.14", "3.14.7", None),            # '~=' and '==X.*' floor too
+        ("==3.14.*", "3.14.7", None),
+        (">=3.12,>=3.14.2", "3.14.7", None),   # the highest floor counts
+        (">=3.15", "3.14.7", None),            # would LOWER it
+        ("===3.15.0", "3.14.7", None),         # same, via arbitrary equality
     ],
 )
 def test_bumped_requires_python_only_ever_raises(requires_python, version, expected):
-    assert cli.bumped_requires_python(requires_python, version) == expected
+    assert cli.bumped_requires_python(SpecifierSet(requires_python), version) == expected
+
+
+@pytest.mark.parametrize(
+    ("requires_python", "latest", "expected"),
+    [
+        (">=3.11", "3.14.7", (">=3.14", "3.14.7")),     # bump + pin
+        (None, "3.14.7", (">=3.14", "3.14.7")),
+        (">=3.10,<3.13", "3.14.7", (">=3.14", "3.14.7")),  # old cap doesn't block a bump
+        (">=3.14", "3.14.7", (None, "3.14.7")),          # keep + pin
+        ("==3.14.*", "3.14.7", (None, "3.14.7")),
+        (">=3.15", "3.14.7", (None, None)),              # older than the floor
+        ("==3.13", "3.13.5", (None, None)),              # kept, but excludes 3.13.5
+        (">=3.11.*", "3.14.7", (None, None)),            # can't parse -> don't guess
+        (">=3.11", None, (None, None)),                  # nothing installed
+    ],
+)
+def test_plan_full(monkeypatch, requires_python, latest, expected):
+    monkeypatch.setattr(cli, "latest_installed_python", lambda: latest)
+    assert cli.plan_full(requires_python) == expected
+
+
+def test_plan_full_without_packaging_skips_instead_of_guessing(monkeypatch, capsys):
+    # packaging is a declared dependency, but the module still imports
+    # without it (e.g. 'pip install --no-deps', tried for real) -- --full
+    # must then leave requires-python alone rather than parse it by hand.
+    monkeypatch.setattr(cli, "SpecifierSet", None)
+    monkeypatch.setattr(cli, "latest_installed_python", lambda: "3.14.7")
+
+    assert cli.plan_full(">=3.11") == (None, None)
+    assert "needs the 'packaging' module" in capsys.readouterr().err
 
 
 def test_refresh_python_version_pins_the_given_version(tmp_path, monkeypatch):

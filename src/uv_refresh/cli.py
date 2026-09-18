@@ -61,17 +61,14 @@ except ModuleNotFoundError:  # Fallback, damit das Skript auch nackt laeuft
     Requirement = None
     InvalidRequirement = ValueError  # ty: ignore[invalid-assignment]
 
-# own try block: ty flags the 'Requirement = None' fallback above as soon as
-# a second import shares its try
-try:
+try:  # --full's requires-python handling; without packaging, plan_full() skips it
     from packaging.specifiers import InvalidSpecifier, SpecifierSet
-except ModuleNotFoundError:  # same fallback -- python_allowed() then only checks the lower bound
-    SpecifierSet = None
-    InvalidSpecifier = ValueError  # ty: ignore[invalid-assignment]
+    from packaging.version import InvalidVersion, Version
+except ModuleNotFoundError:
+    SpecifierSet = None  # ty: ignore[invalid-assignment]
 
 _SPEC_RE = re.compile(r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?P<extras>\[[^\]]*\])?")
 _RELEASE_RE = re.compile(r"\d+(?:\.\d+)*")
-_LOWER_BOUND_RE = re.compile(r"^\s*(?P<op>>=|>|~=|===|==)\s*(?P<release>\d+(?:\.\d+)*)")
 
 C_OK, C_WARN, C_ERR, C_DIM, C_OFF = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
 
@@ -323,76 +320,88 @@ def requires_python_floor(version: str) -> str:
     return f">={major_minor}"
 
 
-def _release(version: str) -> tuple[int, ...]:
-    """'3.13.0' -> (3, 13): the leading numeric release segment, trailing
-    zeros dropped so 3.13 and 3.13.0 compare equal (as PEP 440 has them)."""
-    m = _RELEASE_RE.match(version.strip())
-    parts = [int(p) for p in m.group().split(".")] if m else []
-    while parts and parts[-1] == 0:
-        parts.pop()
-    return tuple(parts)
+def _lower_bound(spec: SpecifierSet) -> Version | None:
+    """The highest version 'spec' puts a floor at -- '>=3.11', '>3.11',
+    '~=3.11' and '==3.11.*' all floor at 3.11. None if it has no floor at
+    all (empty, or only '<'/'!=' clauses)."""
+    bounds = []
+    for s in spec:
+        if s.operator in (">=", ">", "~=", "==", "==="):
+            with contextlib.suppress(InvalidVersion):  # '===' may hold any string
+                bounds.append(Version(s.version.removesuffix(".*")))
+    return max(bounds, default=None)
 
 
-def requires_python_lower_bound(requires_python: str | None) -> tuple[tuple[int, ...], bool] | None:
-    """Strictest lower bound in a requires-python specifier like '>=3.11,<4',
-    as (release, inclusive) -- '>' is the one exclusive operator, '>=', '~='
-    and '==' (incl. '==3.12.*') are inclusive. None if there is no lower
-    bound at all (unset, or only '<'/'!=' clauses).
-
-    A small regex instead of packaging.specifiers, so this also works in the
-    no-packaging fallback (see the import at the top).
-    """
-    bounds: list[tuple[tuple[int, ...], bool]] = []
-    for clause in (requires_python or "").split(","):
-        if m := _LOWER_BOUND_RE.match(clause):
-            bounds.append((_release(m.group("release")), m.group("op") != ">"))
-    if not bounds:
-        return None
-    # highest release wins; on a tie, '>3.12' is stricter than '>=3.12'
-    return max(bounds, key=lambda b: (b[0], not b[1]))
-
-
-def python_allowed(requires_python: str | None, version: str) -> bool:
-    """Whether 'version' satisfies requires-python as it stands -- i.e.
-    whether 'uv python pin <version>' would be accepted against it.
-
-    Upper bounds count too (e.g. an exact '==3.13' with 3.13.5 installed),
-    via packaging's full specifier check. Without packaging, or for a spec it
-    can't parse, only the lower bound is checked -- whatever slips through
-    that way is still refused by 'uv python pin' itself: a reported failure
-    after the rebuild, never a wrong pin.
-    """
-    if not requires_python:
-        return True
-    if SpecifierSet is not None:
-        with contextlib.suppress(InvalidSpecifier):
-            return SpecifierSet(requires_python).contains(version)
-    bound = requires_python_lower_bound(requires_python)
-    if bound is None:
-        return True
-    release, inclusive = bound
-    v = _release(version)
-    return v > release or (inclusive and v == release)
-
-
-def bumped_requires_python(requires_python: str | None, version: str) -> str | None:
+def bumped_requires_python(current: SpecifierSet, version: str) -> str | None:
     """--full: the requires-python to write for 'version' -- its major.minor
     floor (see requires_python_floor), but only if that's actually HIGHER
-    than the project's current lower bound. None means keep requires-python
-    as it is: writing the floor anyway could LOWER it, e.g. '>=3.15' ->
-    '>=3.14' on a machine whose newest Python happens to be 3.14 -- silently
-    widening what the project claims to support.
+    than the current floor. None means keep requires-python as it is:
+    writing the floor anyway could LOWER it, e.g. '>=3.15' -> '>=3.14' on a
+    machine whose newest Python happens to be 3.14 -- silently widening what
+    the project claims to support.
     """
     floor = requires_python_floor(version)
-    bound = requires_python_lower_bound(requires_python)
-    if bound is not None and _release(floor.removeprefix(">=")) <= bound[0]:
+    bound = _lower_bound(current)
+    if bound is not None and Version(floor.removeprefix(">=")) <= bound:
         return None
     return floor
 
 
+def plan_full(requires_python: str | None) -> tuple[str | None, str | None]:
+    """--full, decided once before anything is touched: returns (the new
+    requires-python, or None to keep it; the version to re-pin
+    .python-version to, or None to leave it), and says which it is.
+
+    A requires-python this can't evaluate -- invalid, or packaging missing
+    (see the import at the top) -- is left alone rather than guessed at.
+    """
+    unchanged = "leaving requires-python/.python-version unchanged"
+    if SpecifierSet is None:
+        say(f"\n--full: needs the 'packaging' module (a uv-refresh dependency), {unchanged}", C_WARN)
+        return None, None
+    latest = latest_installed_python()
+    if latest is None:
+        say(
+            f"\n--full: no installed Python found (uv python list, pre-releases skipped), {unchanged}",
+            C_WARN,
+        )
+        return None, None
+    try:
+        current = SpecifierSet(requires_python or "")
+    except InvalidSpecifier:
+        say(f"\n--full: can't parse requires-python {requires_python!r}, {unchanged}", C_WARN)
+        return None, None
+
+    if new := bumped_requires_python(current, latest):
+        # the bump replaces the whole specifier, so only the new floor
+        # (which 'latest' satisfies by construction) matters for the pin
+        say(
+            f"\n--full: requires-python will be bumped to {new} and .python-version re-pinned to {latest}.",
+            C_DIM,
+        )
+        return new, latest
+    if latest in current:
+        say(
+            f"\n--full: requires-python {requires_python} already starts at Python {latest}'s minor "
+            f"version or above, kept as is; .python-version will be re-pinned to {latest}.",
+            C_DIM,
+        )
+        return None, latest
+    # requires-python is kept, but excludes 'latest' (older than its floor,
+    # or e.g. an exact '==3.13' with 3.13.5 installed): 'uv python pin' would
+    # refuse, and lowering or loosening requires-python to make it fit is
+    # not ours to decide
+    say(
+        f"\n--full: newest installed Python {latest} doesn't satisfy requires-python "
+        f"{requires_python}, {unchanged}",
+        C_WARN,
+    )
+    return None, None
+
+
 def refresh_python_version(root: Path, dry: bool, version: str) -> None:
     """--full: drops whatever .python-version currently pins and re-pins the
-    project to 'version' (the newest installed Python -- main() already
+    project to 'version' (the newest installed Python -- plan_full() already
     looked it up, checked requires-python allows it, and bumped
     requires-python in the same rebuild where that was needed).
 
@@ -556,7 +565,7 @@ def build_and_swap(
     unchanged -- 'backup' is kept regardless, as an extra safety net.
 
     new_requires_python is only set when --full decided requires-python has
-    to go up (see main() / bumped_requires_python()); it's then written as
+    to go up (see plan_full()); it's then written as
     part of this same atomic rebuild, and 'uv init' below targets it too --
     main() re-pins .python-version afterwards, once requires-python already
     allows that pin.
@@ -733,44 +742,7 @@ def main() -> int:
     # already, and the requires-python bump and the pin after the swap must
     # both use the SAME lookup -- a second one could return something
     # different (e.g. a Python installed in between).
-    new_requires_python: str | None = None
-    pin_python: str | None = None
-    if args.full:
-        latest = latest_installed_python()
-        if latest is None:
-            say(
-                "\n--full: no installed Python found (uv python list, pre-releases skipped), "
-                "leaving requires-python/.python-version unchanged",
-                C_WARN,
-            )
-        elif new_requires_python := bumped_requires_python(specs.requires_python, latest):
-            # the bump replaces the whole specifier, so only the new floor
-            # (which 'latest' satisfies by construction) matters for the pin
-            pin_python = latest
-            say(
-                f"\n--full: requires-python will be bumped to {new_requires_python} "
-                f"and .python-version re-pinned to {latest}.",
-                C_DIM,
-            )
-        elif python_allowed(specs.requires_python, latest):
-            pin_python = latest
-            say(
-                f"\n--full: requires-python {specs.requires_python} already starts at "
-                f"Python {latest}'s minor version or above, kept as is; "
-                f".python-version will be re-pinned to {latest}.",
-                C_DIM,
-            )
-        else:
-            # requires-python is kept, but excludes 'latest' (older than its
-            # floor, or e.g. an exact '==3.13' with 3.13.5 installed): 'uv
-            # python pin' would refuse, and lowering or loosening
-            # requires-python to make it fit is not ours to decide
-            say(
-                f"\n--full: newest installed Python {latest} doesn't satisfy "
-                f"requires-python {specs.requires_python}, "
-                "leaving requires-python/.python-version unchanged",
-                C_WARN,
-            )
+    new_requires_python, pin_python = plan_full(specs.requires_python) if args.full else (None, None)
 
     if args.dry_run:
         say("\n--dry-run: from here on, this would happen:", C_DIM)
@@ -806,10 +778,11 @@ def main() -> int:
         return 1
 
     # ---- 7. .python-version ------------------------------------------------
-    # (steps 2-6 are build_and_swap's) Only after the atomic swap above: if requires-python had to go up to
-    # allow pin_python, the real pyproject.toml has that bump by now, so 'uv
-    # python pin' passes its own requires-python check instead of failing
-    # against the OLD (pre-swap) constraint.
+    # (steps 2-6 are build_and_swap's) Only after the atomic swap above: if
+    # requires-python had to go up to allow pin_python, the real
+    # pyproject.toml has that bump by now, so 'uv python pin' passes its own
+    # requires-python check instead of failing against the OLD (pre-swap)
+    # constraint.
     if pin_python:
         try:
             refresh_python_version(root, args.dry_run, pin_python)
