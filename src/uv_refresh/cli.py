@@ -17,6 +17,7 @@ Steps:
      else (description, readme, license, authors, keywords, [project.urls],
      [project.scripts], [build-system], [tool.*], ...) stays untouched
   5. Atomically swap the result in place of the old pyproject.toml/uv.lock
+  6. Report which version bounds actually moved
 
 If any step fails -- including Ctrl+C -- the real pyproject.toml was never
 touched, since the whole build happened in the temp directory. The backup
@@ -48,11 +49,14 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import tomllib
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -83,6 +87,10 @@ C_OK, C_WARN, C_ERR, C_DIM, C_OFF = "\033[32m", "\033[33m", "\033[31m", "\033[2m
 # --timeout only covers the uv calls that resolve/lock
 _HELPER_TIMEOUT = 60
 
+TEMP_NOTE = (
+    "Building in a temp directory; your real pyproject.toml/uv.lock stay untouched until the final step."
+)
+
 _quiet = False
 
 
@@ -107,6 +115,57 @@ def say(msg: str, color: str = "") -> None:
 def die(msg: str) -> NoReturn:
     say(f"ERROR: {msg}", C_ERR)
     sys.exit(1)
+
+
+def _wrap_width() -> int:
+    """Usable width for wrapped lists -- one column short of the real terminal,
+    so its own wrap never adds a second break on top of ours."""
+    return max(shutil.get_terminal_size(fallback=(100, 24)).columns - 1, 40)
+
+
+def say_row(label: str, value: str, width: int, color: str = "") -> None:
+    """One 'label : value' line, padded to a width shared by all rows and
+    wrapped with a hanging indent.
+
+    A real project's dependency list is one long comma-joined string --
+    unwrapped, 30 dependencies are ~700 characters of ragged reflow directly
+    above the confirmation prompt, which is exactly where it has to be read.
+    """
+    prefix = f"  {label.ljust(width)} : "
+    if not value:
+        # textwrap.fill('') has no words to lay out and returns '' -- the
+        # prefix would vanish and the row print as a blank line
+        say(prefix.rstrip(), color)
+        return
+    say(
+        textwrap.fill(
+            value,
+            width=_wrap_width(),
+            initial_indent=prefix,
+            subsequent_indent=" " * len(prefix),
+            break_long_words=False,
+            break_on_hyphens=False,
+        ),
+        color,
+    )
+
+
+def confirm(prompt: str) -> bool:
+    """Asks until the answer is recognisable; empty input means no.
+
+    A typo used to count as 'no' and abort the whole run -- safe, but it
+    reads as if the tool ignored what was typed.
+    """
+    while True:
+        try:
+            answer = input(f"\n{prompt}").strip().lower()
+        except EOFError:
+            die("No input possible (no terminal). Use --yes to run without confirmation.")
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("", "n", "no"):
+            return False
+        say("Please answer y or n.", C_WARN)
 
 
 def strip_version(spec: str, keep_extras: bool = True, keep_markers: bool = True) -> str | None:
@@ -295,15 +354,26 @@ def build_init_cmd(name: str | None, requires_python: str | None, description: s
 
 
 def run(cmd: list[str], cwd: Path, dry: bool, timeout: float | None = None) -> None:
-    say(f"  $ {' '.join(cmd)}", C_DIM)
+    # --quiet has to reach uv itself: run() never captures the child's output,
+    # so without this uv keeps streaming its progress and -q only strips OUR
+    # labels -- leaving unlabelled 'Resolved N packages' blocks that say less
+    # than the full output did. uv takes --quiet as a global flag, before the
+    # subcommand, and still reports errors through it.
+    if _quiet and cmd[:1] == ["uv"]:
+        cmd = [cmd[0], "--quiet", *cmd[1:]]
+    # shlex, not ' '.join: an unquoted marker ('httpx; sys_platform == "win32"')
+    # printed as a copy-pasteable '$ ' line is a DIFFERENT command -- the ';'
+    # splits it. The argv we pass was always right; only the echo lied.
+    shown = shlex.join(cmd)
+    say(f"  $ {shown}", C_DIM)
     if dry:
         return
     try:
         result = subprocess.run(cmd, cwd=cwd, check=False, timeout=timeout)
     except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"Command ran longer than {timeout:.0f}s and was aborted: {' '.join(cmd)}") from e
+        raise RuntimeError(f"Command ran longer than {timeout:.0f}s and was aborted: {shown}") from e
     if result.returncode != 0:
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+        raise RuntimeError(f"Command failed: {shown}")
 
 
 def latest_installed_python() -> str | None:
@@ -621,6 +691,126 @@ def _canonical_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+def _name_and_bound(spec: str) -> tuple[str, str] | None:
+    """Canonical package name and the version bound of a PEP 508 spec -- '' when
+    it has none -- or None if the entry can't be parsed at all.
+
+    Unlike strip_version(), this keeps the bound and drops everything else:
+    the two halves of the same string, used for opposite purposes.
+    """
+    if Requirement is not None:
+        try:
+            req = Requirement(spec)
+        except InvalidRequirement:
+            return None
+        if req.url:  # 'paket @ git+https://...' carries no comparable bound
+            return _canonical_name(req.name), f"@ {req.url}"
+        return _canonical_name(req.name), str(req.specifier)
+
+    # Fallback, falls packaging fehlt -- siehe strip_version()
+    head = spec.partition(";")[0]
+    name_part, at, url = head.partition("@")
+    m = _SPEC_RE.match(name_part if at else head)
+    if not m:
+        return None
+    if at:
+        return _canonical_name(m.group("name")), f"@ {url.strip()}"
+    return _canonical_name(m.group("name")), head[m.end() :].strip()
+
+
+def collect_bounds(data: dict) -> dict[tuple[str, str], str]:
+    """Every dependency's version bound, keyed by (section, canonical name).
+
+    Keyed by section and not by name alone: the same package can sit in
+    dependencies AND in a group with a different bound, and collapsing both
+    onto one key made a move in whichever came second read as 'nothing
+    changed' -- a wrong report, not just an incomplete one.
+    """
+    project = data.get("project", {})
+    sections: list[tuple[str, list]] = [("dependencies", project.get("dependencies") or [])]
+    sections += [
+        (f"optional [{g}]", e) for g, e in (project.get("optional-dependencies") or {}).items()
+    ]
+    sections += [(f"group [{g}]", e) for g, e in (data.get("dependency-groups") or {}).items()]
+
+    out: dict[tuple[str, str], str] = {}
+    for section, entries in sections:
+        for entry in entries:
+            if isinstance(entry, str) and (parsed := _name_and_bound(entry)):
+                name, bound = parsed
+                out[(section, name)] = bound
+    return out
+
+
+def _deps(n: int) -> str:
+    """'1 dependency' / '3 dependencies' -- the summary prints these counts
+    often enough that '1 dependencies' would stand out."""
+    return "1 dependency" if n == 1 else f"{n} dependencies"
+
+
+def report_changes(original_text: str, new_text: str) -> None:
+    """Prints which version bounds the rebuild actually moved.
+
+    Without this the run ends on a bare 'Done.' -- yet the bounds it just
+    changed ARE the point of uv-refresh, and were otherwise only visible by
+    diffing the backup by hand.
+
+    Counts are per package, not per entry: one package listed in three groups
+    is one line, because that is how anyone reads their own dependency list.
+    """
+    try:
+        old = collect_bounds(tomllib.loads(original_text))
+        new = collect_bounds(tomllib.loads(new_text))
+    except tomllib.TOMLDecodeError:  # nur der Report -- der Swap steht schon
+        return
+
+    unset = "(none)"
+    # one row per distinct (name, was, now): the same package moving the same
+    # way in two sections moved once. Only when the SAME package moved
+    # DIFFERENTLY per section do two rows survive -- and those get named.
+    rows: dict[tuple[str, str, str], list[str]] = {}
+    for (section, name), bound in new.items():
+        was = old.get((section, name))
+        if was is not None and was != bound:
+            rows.setdefault((name, was or unset, bound or unset), []).append(section)
+
+    per_name = Counter(name for name, _, _ in rows)
+    changed = sorted(
+        (name if per_name[name] == 1 else f"{name} ({', '.join(sections)})", was, now)
+        for (name, was, now), sections in rows.items()
+    )
+
+    # presence is a question about the project, not about one section: a
+    # package dropped from a group but still in dependencies was not removed
+    old_names = {name for _, name in old}
+    new_names = {name for _, name in new}
+    added = sorted(new_names - old_names)
+    removed = sorted(old_names - new_names)
+    unchanged = len(new_names) - len(per_name) - len(added)
+
+    if changed:
+        say(f"\nUpdated {len(per_name)} of {_deps(len(new_names))}:", C_OK)
+        name_w = max(len(name) for name, _, _ in changed)
+        was_w = max(len(was) for _, was, _ in changed)
+        for name, was, now in changed:
+            say(f"  {name.ljust(name_w)}  {was.rjust(was_w)} -> {now}")
+        if unchanged:
+            say(f"  ({unchanged} unchanged)", C_DIM)
+    elif unchanged and not added and not removed:
+        # 'unchanged' guards a project with no dependencies at all, which
+        # main() refuses long before this -- but 'all 0 dependencies' would
+        # be a silly thing to ever print
+        say(f"\nNo bounds changed -- {_deps(unchanged)} already current.", C_OK)
+
+    extra = [("added", added), ("removed", removed)]
+    width = max((len(label) for label, names in extra if names), default=0)
+    if width:  # a blank line, so these don't read as another 'Updated' row
+        say("")
+    for label, names in extra:
+        if names:
+            say_row(label, ", ".join(names), width)
+
+
 def no_groups_blocker(tool_uv: dict) -> str | None:
     """--no-groups: what in [tool.uv] still names an extra or group that
     --no-groups is about to remove, or None if nothing does.
@@ -852,8 +1042,27 @@ def build_and_swap(
             new_lock = build_dir / "uv.lock"
             if new_lock.is_file():
                 os.replace(new_lock, lock)
+            # only now, against what actually landed -- reporting before the
+            # swap would describe a rebuild that a failing os.replace never made
+            report_changes(original_text, merged)
         else:
             say("  $ (pyproject.toml/uv.lock would now be atomically replaced)", C_DIM)
+
+
+def positive_seconds(value: str) -> float:
+    """argparse type for --timeout.
+
+    A zero or negative timeout used to be accepted and only surfaced mid-run,
+    as 'Command ran longer than -5s and was aborted' -- after the backup had
+    already been written.
+    """
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number") from None
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError(f"must be greater than 0, not {value}")
+    return seconds
 
 
 def main() -> int:
@@ -867,9 +1076,14 @@ def main() -> int:
     p.add_argument(
         "--verbose", "-v", action="store_true", help="print the full new pyproject.toml at the end"
     )
-    p.add_argument("--quiet", "-q", action="store_true", help="only print warnings/errors, no status output")
     p.add_argument(
-        "--timeout", type=float, default=300.0, help="timeout in seconds per uv call (default: 300)"
+        "--quiet", "-q", action="store_true", help="only print warnings/errors (also quiets uv itself)"
+    )
+    p.add_argument(
+        "--timeout",
+        type=positive_seconds,
+        default=300.0,
+        help="timeout in seconds per uv call (default: 300)",
     )
     p.add_argument(
         "--keep-lock", action="store_true", help="keep uv.lock (uv will then prefer the old versions!)"
@@ -926,11 +1140,17 @@ def main() -> int:
     original_text, specs = load_project_specs(pyproject, args)
 
     say(f"\nProject: {specs.name or '(no name)'}   [{root}]", C_OK)
-    say(f"  dependencies      : {', '.join(specs.main_deps) or '-'}")
-    for g, n in specs.extras.items():
-        say(f"  optional [{g}]    : {', '.join(n)}")
-    for g, n in specs.groups.items():
-        say(f"  group [{g}]       : {', '.join(n)}")
+    rows = [
+        ("dependencies", specs.main_deps),
+        *((f"optional [{g}]", n) for g, n in specs.extras.items()),
+        *((f"group [{g}]", n) for g, n in specs.groups.items()),
+    ]
+    # width from the actual labels: the padding used to be hardcoded, so the
+    # colons never quite lined up and any longer group name pushed its own
+    # line out of the column entirely
+    label_width = max(len(label) for label, _ in rows)
+    for label, names in rows:
+        say_row(label, ", ".join(names) or "-", label_width)
 
     # ---- Was sich aendert ---------------------------------------------------
     # dependencies/optional-dependencies/dependency-groups werden ersetzt,
@@ -954,13 +1174,17 @@ def main() -> int:
     if args.dry_run:
         say("\n--dry-run: from here on, this would happen:", C_DIM)
     elif not args.yes:
-        prompt = "Rebuild pyproject.toml (and re-pin Python) now? [Y/N] " if pin_python \
-            else "Rebuild pyproject.toml now? [Y/N] "
-        try:
-            answer = input(f"\n{prompt}").strip().lower()
-        except EOFError:
-            die("No input possible (no terminal). Use --yes to run without confirmation.")
-        if answer not in ("y", "yes"):
+        # TEMP_NOTE goes ABOVE the prompt: it answers the exact question the
+        # prompt raises ("and if this goes wrong?"), so printing it after the
+        # answer was already given was too late to be of any use. --dry-run
+        # and --yes ask nothing, and keep it further down with the backup line.
+        say(f"\n{TEMP_NOTE}", C_DIM)
+        prompt = (
+            "Rebuild pyproject.toml (and re-pin Python) now? [y/N] "
+            if pin_python
+            else "Rebuild pyproject.toml now? [y/N] "
+        )
+        if not confirm(prompt):
             say("Aborted.", C_DIM)
             return 1
 
@@ -968,10 +1192,8 @@ def main() -> int:
     stamp = datetime.now(UTC).astimezone().strftime("%Y%m%d-%H%M%S")
     backup = root / ".uv-refresh-backup" / stamp
     say(f"\nBackup -> {backup}", C_DIM)
-    say(
-        "Building in a temp directory; your real pyproject.toml/uv.lock stay untouched until the final step.",
-        C_DIM,
-    )
+    if args.dry_run or args.yes:
+        say(TEMP_NOTE, C_DIM)
 
     try:
         build_and_swap(
@@ -993,6 +1215,7 @@ def main() -> int:
     # requires-python check instead of failing against the OLD (pre-swap)
     # constraint.
     if pin_python:
+        say("")  # the pin is its own step, not another row of the change summary
         try:
             refresh_python_version(root, args.dry_run, pin_python)
         except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 -- siehe oben:

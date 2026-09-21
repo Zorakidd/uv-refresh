@@ -2,3 +2,4 @@
 __pycache__/
 .venv/
 .uv-refresh-backup/
+.uv-refresh-tmp-*/

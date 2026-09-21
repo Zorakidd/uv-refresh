@@ -1,3 +1,4 @@
+import shlex
 import shutil
 import subprocess
 import sys
@@ -636,7 +637,7 @@ def test_main_confirmation_accepts_yes(tmp_path, monkeypatch):
     assert started == [True]
 
 
-def test_main_confirmation_rejects_anything_else(tmp_path, monkeypatch):
+def test_main_confirmation_aborts_on_no(tmp_path, monkeypatch):
     pyproject = tmp_path / "pyproject.toml"
     pyproject.write_text(
         '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n',
@@ -1042,3 +1043,292 @@ def test_quiet_suppresses_status_but_not_warnings(capsys, monkeypatch):
     out, err = capsys.readouterr()
     assert "status message" not in out
     assert "warning message" in err
+
+
+# ---- console output -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ("requests>=2.0", ("requests", ">=2.0")),
+        ("requests", ("requests", "")),
+        ("Flask_Login>=1", ("flask-login", ">=1")),
+        ('fastapi[standard]>=0.110; python_version<"3.13"', ("fastapi", ">=0.110")),
+        ("pkg @ git+https://example.com/r.git", ("pkg", "@ git+https://example.com/r.git")),
+        ("!!!", None),
+    ],
+)
+def test_name_and_bound(spec, expected):
+    assert cli._name_and_bound(spec) == expected
+
+
+def test_collect_bounds_spans_every_section():
+    data = tomllib.loads(
+        '[project]\nname = "d"\ndependencies = ["a>=1"]\n'
+        '[project.optional-dependencies]\nweb = ["b==2"]\n'
+        '[dependency-groups]\ndev = ["c"]\n'
+    )
+    assert cli.collect_bounds(data) == {
+        ("dependencies", "a"): ">=1",
+        ("optional [web]", "b"): "==2",
+        ("group [dev]", "c"): "",
+    }
+
+
+def test_collect_bounds_ignores_non_string_entries():
+    data = {"dependency-groups": {"dev": [{"include-group": "other"}, "a>=1"]}}
+    assert cli.collect_bounds(data) == {("group [dev]", "a"): ">=1"}
+
+
+def test_report_changes_lists_every_moved_bound(capsys):
+    old = '[project]\nname = "d"\ndependencies = ["a>=1.0", "b", "c>=3.0"]\n'
+    new = '[project]\nname = "d"\ndependencies = ["a>=2.0", "b>=9.1", "c>=3.0"]\n'
+
+    cli.report_changes(old, new)
+
+    out = capsys.readouterr().out
+    assert "Updated 2 of 3 dependencies:" in out
+    assert ">=1.0 -> >=2.0" in out
+    assert "(none) -> >=9.1" in out
+    assert "(1 unchanged)" in out
+    assert ">=3.0" not in out  # c never moved, so it gets no row of its own
+
+
+def test_report_changes_says_so_when_nothing_moved(capsys):
+    same = '[project]\nname = "d"\ndependencies = ["a>=1.0"]\n'
+
+    cli.report_changes(same, same)
+
+    assert "1 dependency already current" in capsys.readouterr().out
+
+
+def test_report_changes_names_removed_dependencies(capsys):
+    old = '[project]\nname = "d"\ndependencies = ["a>=1.0"]\n[dependency-groups]\ndev = ["b>=2"]\n'
+    new = '[project]\nname = "d"\ndependencies = ["a>=1.0"]\n'
+
+    cli.report_changes(old, new)
+
+    assert "removed : b" in capsys.readouterr().out
+
+
+def test_report_changes_stays_silent_on_unparseable_toml(capsys):
+    cli.report_changes("[project", '[project]\nname = "d"\n')
+
+    assert capsys.readouterr().out == ""
+
+
+def test_run_echoes_a_shell_quotable_command(capsys):
+    argv = ["uv", "add", "--no-sync", "fastapi[standard]", 'httpx; sys_platform == "win32"']
+
+    cli.run(argv, Path("."), dry=True)
+
+    echoed = capsys.readouterr().out.strip().removeprefix("$ ").strip()
+    # unquoted, the ';' alone made this a different command when pasted
+    assert shlex.split(echoed) == argv
+
+
+def test_run_passes_quiet_through_to_uv(monkeypatch):
+    monkeypatch.setattr(cli, "_quiet", True)
+    seen = []
+    monkeypatch.setattr(
+        cli.subprocess, "run", lambda cmd, **kw: seen.append(cmd) or subprocess.CompletedProcess(cmd, 0)
+    )
+
+    cli.run(["uv", "add", "x"], Path("."), dry=False)
+
+    assert seen == [["uv", "--quiet", "add", "x"]]
+
+
+def test_run_leaves_non_uv_commands_alone(monkeypatch):
+    monkeypatch.setattr(cli, "_quiet", True)
+    seen = []
+    monkeypatch.setattr(
+        cli.subprocess, "run", lambda cmd, **kw: seen.append(cmd) or subprocess.CompletedProcess(cmd, 0)
+    )
+
+    cli.run(["icacls", "x"], Path("."), dry=False)
+
+    assert seen == [["icacls", "x"]]
+
+
+def test_say_row_aligns_on_the_shared_width(capsys):
+    width = len("group [integration]")
+    cli.say_row("dependencies", "a", width)
+    cli.say_row("group [integration]", "b", width)
+
+    first, second = capsys.readouterr().out.splitlines()
+    assert first.index(":") == second.index(":")
+
+
+def test_say_row_wraps_long_lists_with_a_hanging_indent(capsys, monkeypatch):
+    monkeypatch.setattr(cli, "_wrap_width", lambda: 40)
+
+    cli.say_row("dependencies", ", ".join(f"package-{i}" for i in range(12)), len("dependencies"))
+
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) > 1
+    assert all(len(line) <= 40 for line in lines)
+    indent = lines[0].index(":") + 2
+    assert all(line.startswith(" " * indent) for line in lines[1:])
+
+
+@pytest.mark.parametrize("answer", ["y", "yes", "Y", " YES "])
+def test_confirm_accepts_yes(monkeypatch, answer):
+    monkeypatch.setattr("builtins.input", lambda _prompt: answer)
+    assert cli.confirm("go? ") is True
+
+
+@pytest.mark.parametrize("answer", ["n", "no", "", "   "])
+def test_confirm_treats_no_and_empty_as_decline(monkeypatch, answer):
+    monkeypatch.setattr("builtins.input", lambda _prompt: answer)
+    assert cli.confirm("go? ") is False
+
+
+def test_confirm_reasks_until_the_answer_is_recognisable(monkeypatch, capsys):
+    answers = iter(["maybe", "wat", "y"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+
+    assert cli.confirm("go? ") is True
+    assert capsys.readouterr().err.count("Please answer y or n.") == 2
+
+
+def test_confirm_dies_on_eof(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda _prompt: (_ for _ in ()).throw(EOFError))
+
+    with pytest.raises(SystemExit):
+        cli.confirm("go? ")
+    assert "Use --yes to run without confirmation" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["-5", "0", "-0.1"])
+def test_positive_seconds_rejects_non_positive(value):
+    with pytest.raises(cli.argparse.ArgumentTypeError, match="greater than 0"):
+        cli.positive_seconds(value)
+
+
+def test_positive_seconds_rejects_non_numbers():
+    with pytest.raises(cli.argparse.ArgumentTypeError, match="not a number"):
+        cli.positive_seconds("abc")
+
+
+def test_positive_seconds_accepts_a_real_timeout():
+    assert cli.positive_seconds("12.5") == 12.5
+
+
+def test_main_aligns_the_dependency_rows(tmp_path, monkeypatch, capsys):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n'
+        '[dependency-groups]\ntype-checking-and-linting = ["mypy"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--dry-run"])
+
+    assert cli.main() == 0
+
+    rows = [ln for ln in capsys.readouterr().out.splitlines() if " : " in ln]
+    assert len({row.index(" : ") for row in rows}) == 1
+
+
+def test_main_reassures_before_asking_not_after(tmp_path, monkeypatch, capsys):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path)])
+    seen = []
+    monkeypatch.setattr("builtins.input", lambda prompt: seen.append(capsys.readouterr().out) or "n")
+
+    assert cli.main() == 1
+    # everything printed before input() was called
+    assert cli.TEMP_NOTE in seen[0]
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ("requests>=2.0", ("requests", ">=2.0")),
+        ("requests", ("requests", "")),
+        ("Flask_Login>=1", ("flask-login", ">=1")),
+        ('fastapi[standard]>=0.110; python_version<"3.13"', ("fastapi", ">=0.110")),
+        ("pkg @ git+https://example.com/r.git", ("pkg", "@ git+https://example.com/r.git")),
+        ("pkg[extra] @ https://example.com/x.whl", ("pkg", "@ https://example.com/x.whl")),
+        ("torch==2.1.0+cu118", ("torch", "==2.1.0+cu118")),
+        ("!!!", None),
+    ],
+)
+def test_name_and_bound_fallback_matches_packaging(monkeypatch, spec, expected):
+    # the whole no-packaging branch is dead code under the test suite otherwise
+    monkeypatch.setattr(cli, "Requirement", None)
+    assert cli._name_and_bound(spec) == expected
+
+
+def test_report_changes_sees_a_move_in_the_second_section(capsys):
+    # keyed by name alone, the unchanged main-dep copy hid the group's move
+    # and the run reported 'nothing changed'
+    old = '[project]\nname="d"\ndependencies=["pytest>=9.0"]\n[dependency-groups]\ndev=["pytest>=6.0"]\n'
+    new = '[project]\nname="d"\ndependencies=["pytest>=9.0"]\n[dependency-groups]\ndev=["pytest>=9.0"]\n'
+
+    cli.report_changes(old, new)
+
+    out = capsys.readouterr().out
+    assert "Updated 1 of 1 dependency:" in out
+    assert ">=6.0 -> >=9.0" in out
+
+
+def test_report_changes_counts_one_package_once(capsys):
+    old = '[project]\nname="d"\ndependencies=["pytest>=6.0"]\n[dependency-groups]\ndev=["pytest>=6.0"]\n'
+    new = '[project]\nname="d"\ndependencies=["pytest>=9.0"]\n[dependency-groups]\ndev=["pytest>=9.0"]\n'
+
+    cli.report_changes(old, new)
+
+    out = capsys.readouterr().out
+    assert "Updated 1 of 1 dependency:" in out
+    assert out.count(">=6.0 -> >=9.0") == 1
+
+
+def test_report_changes_names_the_section_when_a_package_moved_two_ways(capsys):
+    old = '[project]\nname="d"\ndependencies=["pytest>=6.0"]\n[dependency-groups]\ndev=["pytest>=7.0"]\n'
+    new = '[project]\nname="d"\ndependencies=["pytest>=9.0"]\n[dependency-groups]\ndev=["pytest>=8.0"]\n'
+
+    cli.report_changes(old, new)
+
+    out = capsys.readouterr().out
+    assert "pytest (dependencies)" in out
+    assert "pytest (group [dev])" in out
+
+
+def test_report_changes_does_not_call_a_package_removed_while_it_remains(capsys):
+    # --no-groups drops the group copy, but pytest is still a main dependency
+    old = '[project]\nname="d"\ndependencies=["pytest>=6.0"]\n[dependency-groups]\ndev=["pytest>=6.0"]\n'
+    new = '[project]\nname="d"\ndependencies=["pytest>=6.0"]\n'
+
+    cli.report_changes(old, new)
+
+    assert "removed" not in capsys.readouterr().out
+
+
+def test_say_row_keeps_the_prefix_when_the_value_is_empty(capsys):
+    # textwrap.fill('') returns '' -- the row used to print as a blank line
+    cli.say_row("dependencies", "", len("dependencies"))
+
+    assert capsys.readouterr().out.strip() == "dependencies :"
+
+
+@pytest.mark.parametrize(
+    ("n", "expected"), [(0, "0 dependencies"), (1, "1 dependency"), (2, "2 dependencies")]
+)
+def test_deps_pluralises(n, expected):
+    assert cli._deps(n) == expected
+
+
+def test_report_changes_is_silent_for_a_project_with_no_dependencies(capsys):
+    empty = '[project]\nname = "d"\n'
+
+    cli.report_changes(empty, empty)
+
+    assert capsys.readouterr().out == ""

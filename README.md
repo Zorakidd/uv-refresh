@@ -17,6 +17,7 @@ resolved instead of dragging along old version pins.
    from the result into a copy of the ORIGINAL `pyproject.toml` -- everything
    else stays untouched
 5. Atomically swap the result in place of the old `pyproject.toml`/`uv.lock`
+6. Report which version bounds actually moved
 
 If any step fails -- including Ctrl+C -- the real `pyproject.toml` was never
 touched, since the whole build happened in the temp directory. The backup
@@ -50,7 +51,7 @@ Or straight from the repo, e.g. to try an unreleased version:
 | `--dry-run` | only show what would happen, touch nothing |
 | `-y`, `--yes` | run without asking for confirmation |
 | `-v`, `--verbose` | print the full new `pyproject.toml` at the end |
-| `-q`, `--quiet` | only print warnings/errors, no status output |
+| `-q`, `--quiet` | only print warnings/errors -- also quiets `uv` itself |
 | `--timeout SECONDS` | timeout per `uv` call, default 300s |
 | `--raw` | add packages with no version bound at all |
 | `--bounds {lower,major,minor,exact}` | kind of version bound `uv add` sets |
@@ -61,6 +62,21 @@ Or straight from the repo, e.g. to try an unreleased version:
 | `--drop-extras` | shrink `fastapi[standard]` down to `fastapi` |
 | `--drop-markers` | drop environment markers |
 | `--version` | show the uv-refresh version |
+
+## What it reports
+
+A run ends with the bounds it actually changed, so there's no need to diff
+the backup by hand:
+
+    Updated 2 of 3 dependencies:
+      iniconfig   >=1.0 -> >=2.3.0
+      packaging  (none) -> >=26.3
+      (1 unchanged)
+
+    Done.
+
+If nothing moved, it says so instead. `--verbose` additionally prints the
+whole new `pyproject.toml`; `--quiet` prints neither.
 
 ## Note
 
