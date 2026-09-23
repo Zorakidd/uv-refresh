@@ -89,7 +89,14 @@ to resolve versions, then takes just the freshly resolved dependency lists
 from it and writes those back into a copy of the original file. Within those
 lists, each entry only gets its new bound in place: comments (above an entry,
 after it, or between two groups) and the order of the entries stay as they
-were.
+were. Direct references (`pkg @ git+https://...`) have no bound to refresh
+and are kept exactly as written. The file keeps its line endings and a
+UTF-8 BOM, if it had one.
+
+Direct references may carry credentials (`https://user:token@...`). The
+output masks them as `https://***@...`, and in a git repository (including
+worktrees, submodules and projects in a subdirectory) the backup and temp
+directories are added to `.gitignore`.
 
 One exception: with `--no-groups`, any existing
 `optional-dependencies`/`dependency-groups` are intentionally removed (the

@@ -86,3 +86,36 @@ def test_refresh_resolves_path_sources_locally(tmp_path, monkeypatch):
 
     assert code == 0
     assert _floor(deps["mylib"]) == Version("0.1.0")
+
+
+_WHEEL = (
+    "https://files.pythonhosted.org/packages/ef/a6/62565a6e1cf69e10f5727360368e451d4b7f58beeac6173dc9db836a5b46/"
+    "iniconfig-2.0.0-py3-none-any.whl"
+)
+
+
+def test_refresh_keeps_direct_references(tmp_path, monkeypatch):
+    # regression test: 'uv add' moved the URL into the temp build's
+    # [tool.uv.sources], which is never merged back -- the entry came out as a
+    # bare 'iniconfig' and uv.lock took it from PyPI (reproduced against real uv).
+    code, deps = _refresh(
+        tmp_path, monkeypatch,
+        _HEADER + f'dependencies = ["iniconfig@{_WHEEL}", "packaging>=20"]\n',
+    )
+
+    assert code == 0
+    assert deps["iniconfig"].url == _WHEEL
+    assert _floor(deps["packaging"]) > Version("20")
+    lock = tomllib.loads((tmp_path / "uv.lock").read_text(encoding="utf-8"))
+    iniconfig = next(p for p in lock["package"] if p["name"] == "iniconfig")
+    assert iniconfig["source"] == {"url": _WHEEL}
+
+
+def test_refresh_does_not_report_a_project_version_change(tmp_path, monkeypatch, capfd):
+    # regression test: the temp build kept uv init's version 0.1.0, so the
+    # final 'uv lock' ended every run with 'Updated demo v0.1.0 -> v1.0.0'.
+    code, _ = _refresh(tmp_path, monkeypatch, _HEADER + 'dependencies = ["packaging>=20"]\n')
+
+    assert code == 0
+    out, err = capfd.readouterr()
+    assert "v0.1.0" not in out + err

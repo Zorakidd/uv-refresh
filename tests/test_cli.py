@@ -219,6 +219,19 @@ dependencies = [
 """
 
 
+@pytest.mark.parametrize("from_uv", ["priv", "priv @ https://example.com/priv-1.0-py3-none-any.whl"])
+def test_merge_dependencies_keeps_direct_references_verbatim(from_uv):
+    # regression test: uv writes a direct reference back as a bare 'priv'
+    # (URL moved to [tool.uv.sources], never merged) -- which then resolved
+    # from PyPI -- or at best respaced. Either way the original text stays.
+    original = (
+        '[project]\nname = "demo"\n'
+        'dependencies = ["priv@https://example.com/priv-1.0-py3-none-any.whl", "a>=1"]\n'
+    )
+    merged = cli.merge_dependencies(original, [from_uv, "a>=2"], {}, {})
+    assert merged == original.replace("a>=1", "a>=2")
+
+
 def test_merge_dependencies_removes_groups_that_are_gone():
     # e.g. what --no-groups produces: groups existed before, nothing to put
     # back this time around.
@@ -255,6 +268,22 @@ def test_ensure_backup_ignored_is_idempotent(tmp_path):
     cli.ensure_backup_ignored(tmp_path)
     text = (tmp_path / ".gitignore").read_text(encoding="utf-8")
     assert text.count(".uv-refresh-backup/") == 1
+
+
+@pytest.mark.parametrize("layout", ["worktree", "subdirectory"])
+def test_ensure_backup_ignored_finds_every_kind_of_repo(tmp_path, layout):
+    # regression test: only 'root/.git' as a directory counted -- in a git
+    # worktree or submodule (.git is a file there) and in any project below
+    # a repo's top level, a backup holding credentials was never ignored.
+    if layout == "worktree":
+        root = tmp_path
+        (root / ".git").write_text("gitdir: /elsewhere/.git/worktrees/wt\n", encoding="utf-8")
+    else:
+        (tmp_path / ".git").mkdir()
+        root = tmp_path / "packages" / "demo"
+        root.mkdir(parents=True)
+    cli.ensure_backup_ignored(root)
+    assert ".uv-refresh-backup/" in (root / ".gitignore").read_text(encoding="utf-8").splitlines()
 
 
 def test_ensure_backup_ignored_skips_non_git_dirs(tmp_path):
@@ -407,6 +436,76 @@ def test_build_adds_without_syncing_and_with_the_projects_uv_config(tmp_path, mo
     build = seen[0][1]
     assert build["tool"] == {"uv": {"constraint-dependencies": ["requests<3"]}}  # [tool.uv] only
     assert build["dependency-groups"] == {"dev": []}  # exists before its own 'uv add'
+    assert build["project"]["version"] == "1.0.0"  # not uv init's, see seed_build_pyproject()
+
+
+def _main_add_calls(tmp_path, monkeypatch, pyproject_text):
+    """main() --yes with a stubbed uv; returns every 'uv add' command it ran."""
+    (tmp_path / "pyproject.toml").write_text(pyproject_text, encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(cli, "run", _stub_run_writing(pyproject_text, calls))
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes"])
+    assert cli.main() == 0
+    return [c for c in calls if c[:2] == ["uv", "add"]]
+
+
+def test_build_adds_direct_references_first_and_raw(tmp_path, monkeypatch):
+    # without --raw, uv moves the URL into [tool.uv.sources], which the merge
+    # never carries back; first, since a regular dependency may need them.
+    wheel = "priv @ https://example.com/priv-1.0-py3-none-any.whl"
+    adds = _main_add_calls(
+        tmp_path, monkeypatch,
+        '[project]\nname = "demo"\nversion = "1.0.0"\n'
+        f'dependencies = ["a>=1", "{wheel}", "b>=1"]\n\n'
+        '[dependency-groups]\ndev = ["pytest>=8"]\n',
+    )
+    assert adds == [
+        ["uv", "add", "--no-sync", "--raw", "--", wheel],
+        ["uv", "add", "--no-sync", "--", "a", "b"],
+        ["uv", "add", "--no-sync", "--group", "dev", "--", "pytest"],
+    ]
+
+
+def test_build_never_hands_a_dependency_to_uv_as_an_option(tmp_path, monkeypatch):
+    # an invalid entry containing '@' is passed on as-is (see strip_version)
+    # -- without '--', uv took this one as its own --index-url flag.
+    adds = _main_add_calls(
+        tmp_path, monkeypatch,
+        '[project]\nname = "demo"\nversion = "1.0.0"\n'
+        'dependencies = ["--index-url=https://evil.example/@x"]\n',
+    )
+    assert adds == [["uv", "add", "--no-sync", "--", "--index-url=https://evil.example/@x"]]
+
+
+@pytest.mark.parametrize(("bom", "newline"), [(False, "\n"), (True, "\n"), (False, "\r\n"), (True, "\r\n")])
+def test_main_keeps_bom_and_line_endings(tmp_path, monkeypatch, bom, newline):
+    # regression test: read_text()/write_text() wrote the platform's line
+    # endings (an LF file came back CRLF on Windows), and a UTF-8 BOM, which
+    # uv accepts, was rejected as 'not valid TOML' (both reproduced).
+    text = '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n'
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_bytes((b"\xef\xbb\xbf" if bom else b"") + text.replace("\n", newline).encode())
+    monkeypatch.setattr(cli, "run", _stub_run_writing(text.replace(">=2.0", ">=2.32.0")))
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes"])
+
+    assert cli.main() == 0
+    expected = text.replace(">=2.0", ">=2.32.0").replace("\n", newline).encode()
+    assert pyproject.read_bytes() == (b"\xef\xbb\xbf" if bom else b"") + expected
+
+
+def test_say_redacts_credentials_in_urls(capsys):
+    # regression test: a direct reference's token was printed verbatim in the
+    # preview, the '$ uv add' echo, errors and the change report.
+    cli.say("  $ uv add 'priv @ git+https://alice:ghp_SECRET@github.com/acme/priv'")
+    cli.say("priv @ https://ghp_SECRET@example.com/x.whl: direct reference", cli.C_WARN)
+    cli.say("index https://pypi.org/simple and pkg @ file:///C:/wheels/x.whl")
+    out, err = capsys.readouterr()
+    assert "SECRET" not in out + err
+    assert "git+https://***@github.com/acme/priv" in out
+    assert "https://***@example.com/x.whl" in err
+    assert "https://pypi.org/simple and pkg @ file:///C:/wheels/x.whl" in out  # nothing else touched
 
 
 def _run_main_full(tmp_path, monkeypatch, requires_python, latest):

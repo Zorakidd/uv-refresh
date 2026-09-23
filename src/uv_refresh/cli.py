@@ -44,6 +44,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import codecs
 import contextlib
 import json
 import os
@@ -81,6 +82,8 @@ except ModuleNotFoundError:
 
 _SPEC_RE = re.compile(r"^\s*(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)\s*(?P<extras>\[[^\]]*\])?")
 _RELEASE_RE = re.compile(r"\d+(?:\.\d+)*")
+# the 'user:token@' part of a URL -- see say()
+_USERINFO_RE = re.compile(r"(?<=://)[^/\s@]+@")
 
 C_OK, C_WARN, C_ERR, C_DIM, C_OFF = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
 
@@ -105,6 +108,11 @@ def say(msg: str, color: str = "") -> None:
     # unterdrueckt nur den Status-Output, nie Warnungen/Fehler.
     if _quiet and color not in (C_WARN, C_ERR):
         return
+    # A direct reference can carry credentials ('pkg @ git+https://user:token@...',
+    # see ensure_backup_ignored), and it used to be printed verbatim -- in the
+    # preview, the '$ uv add' echo, errors and the change report, i.e. in every
+    # CI log. All output passes through here; the argv handed to uv doesn't.
+    msg = _USERINFO_RE.sub("***@", msg)
     stream = sys.stderr if color in (C_WARN, C_ERR) else sys.stdout
     text = f"{color}{msg}{C_OFF}" if color and _color_enabled(stream) else msg
     # flush: piped stdout is block-buffered, stderr isn't -- in
@@ -315,15 +323,19 @@ def prune_backups(root: Path, keep: int) -> None:
 
 def ensure_backup_ignored(root: Path) -> None:
     """Traegt '.uv-refresh-backup/' und '.uv-refresh-tmp-*/' in die .gitignore
-    ein, falls root ein Git-Repo ist.
+    ein, falls root in einem Git-Repo liegt.
 
     Das Backup kann unveraendert uebernommene Direktquellen enthalten, z. B.
     'pkg @ git+https://user:token@...' (siehe strip_version) -- ohne Eintrag
     landet das leicht im naechsten 'git add .'. Dasselbe gilt fuer das
     Temp-Build-Verzeichnis, das nach einem harten Abbruch (kill, Absturz)
     liegen bleibt, statt aufgeraeumt zu werden.
+
+    Gesucht wird '.git' in root UND allen Elternverzeichnissen, als Datei oder
+    Ordner: nur 'root/.git' als Ordner uebersah Worktrees und Submodule (dort
+    ist .git eine Datei) und jedes Projekt in einem Unterordner eines Repos.
     """
-    if not (root / ".git").is_dir():
+    if not any((p / ".git").exists() for p in (root, *root.parents)):
         return
     gitignore = root / ".gitignore"
     text = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
@@ -574,6 +586,12 @@ def _package_key(spec: str) -> str:
     return parsed[0] if parsed else spec.lower()
 
 
+def _is_direct_reference(spec: str) -> bool:
+    """'pkg @ git+https://...' and the like -- see strip_version()."""
+    parsed = _name_and_bound(spec)
+    return parsed is not None and parsed[1].startswith("@")
+
+
 def _update_array(arr, new: list[str]) -> None:
     """Rewrites the tomlkit array 'arr' in place so it holds exactly 'new'.
 
@@ -584,6 +602,11 @@ def _update_array(arr, new: list[str]) -> None:
     and the original order all stay. Matched by requirement first, then by
     package name alone: --drop-extras/--drop-markers change the requirement,
     and uv may write a marker differently than the original did.
+
+    A direct reference keeps its original text: it has no bound to refresh,
+    and whatever uv wrote for it (a respaced URL, or a bare 'pkg' whose URL
+    went to the temp build's [tool.uv.sources], which is never merged back)
+    must not replace it -- a bare 'pkg' silently resolved from PyPI instead.
 
     Old entries without a counterpart (e.g. an include-group, which
     resolve_groups() expanded) are removed, specs without one appended.
@@ -605,7 +628,8 @@ def _update_array(arr, new: list[str]) -> None:
         pending = rest
 
     for i, spec in taken.items():
-        if arr[i] != spec:  # an unchanged entry keeps its exact original text
+        # an unchanged entry keeps its exact original text
+        if arr[i] != spec and not _is_direct_reference(arr[i]):
             arr[i] = spec
     for i in reversed(range(len(old))):
         if i not in taken:
@@ -688,8 +712,15 @@ def seed_build_pyproject(bare_text: str, specs: ProjectSpecs) -> str:
     'mylib' got its bound from an unrelated 'mylib' on PyPI (both reproduced
     against real uv). Only this temp copy is seeded -- merge_dependencies()
     still starts from the original text.
+
+    It also gets the project's real version instead of uv init's 0.1.0:
+    otherwise the final 'uv lock', run once the merge put the real version
+    back, closed every run with 'Updated <project> v0.1.0 -> v1.0.0' --
+    which reads as if uv-refresh had changed the project's version.
     """
     doc = tomlkit.parse(bare_text)
+    if specs.version:
+        doc["project"]["version"] = specs.version
     if specs.tool_uv:
         doc.setdefault("tool", tomlkit.table(is_super_table=True))["uv"] = specs.tool_uv
     for name in specs.extras:
@@ -925,13 +956,23 @@ class ProjectSpecs:
     had_groups: bool  # optional-dependencies/dependency-groups existed in the original,
     # independent of --no-groups -- used for the removal warning below
     tool_uv: dict  # the original [tool.uv] table, see seed_build_pyproject()
+    version: str | None  # see seed_build_pyproject()
+    encoding: str  # 'utf-8-sig' if the original had a BOM -- written back the same way,
+    newline: str  # like its line endings, see load_project_specs()
 
 
 def load_project_specs(pyproject: Path, args: argparse.Namespace) -> tuple[str, ProjectSpecs]:
     """Reads pyproject.toml and extracts what 'uv init'/'uv add' need to
-    re-resolve every dependency. Exits via die() on anything unusable."""
+    re-resolve every dependency. Exits via die() on anything unusable.
+
+    Read as bytes, so the rebuilt file can be written with the original's
+    BOM and line endings: read_text()/write_text() turned every file into
+    the platform's line endings (an LF file came back CRLF on Windows -- a
+    whole-file diff), and a BOM, which uv accepts, failed as 'not valid TOML'.
+    """
     try:
-        original_text = pyproject.read_text(encoding="utf-8")
+        raw = pyproject.read_bytes()
+        original_text = raw.decode("utf-8-sig").replace("\r\n", "\n")
     except UnicodeDecodeError as e:
         die(f"pyproject.toml is not UTF-8 encoded: {e}")
     try:
@@ -993,6 +1034,9 @@ def load_project_specs(pyproject: Path, args: argparse.Namespace) -> tuple[str, 
         groups=groups,
         had_groups=had_groups,
         tool_uv=tool_uv,
+        version=project.get("version"),
+        encoding="utf-8-sig" if raw.startswith(codecs.BOM_UTF8) else "utf-8",
+        newline="\r\n" if b"\r\n" in raw else "\n",
     )
 
 
@@ -1058,7 +1102,7 @@ def build_and_swap(
         if args.dry_run:
             if specs.tool_uv:
                 say("  $ (the project's [tool.uv] settings would now go into the temp pyproject.toml)", C_DIM)
-        elif specs.tool_uv or specs.extras or specs.groups:
+        else:
             bare = build_dir / "pyproject.toml"
             bare.write_text(seed_build_pyproject(bare.read_text(encoding="utf-8"), specs), encoding="utf-8")
 
@@ -1074,14 +1118,26 @@ def build_and_swap(
         if args.bounds:
             flags += ["--bounds", args.bounds]
 
-        if specs.main_deps:
-            run([*add, *flags, *specs.main_deps], build_dir, args.dry_run, args.timeout)
+        def add_all(target: list[str], deps: list[str]) -> None:
+            # Direct references go in first and with --raw: without it, uv
+            # moves their URL into the temp build's [tool.uv.sources], which
+            # is never merged back -- 'pkg @ https://...' came out as a bare
+            # 'pkg', resolved from PyPI (reproduced against real uv). First,
+            # because a regular dependency may need the package only they
+            # provide. '--' ends uv's options: an entry like
+            # '--index-url=https://...' is a (broken) package, never a flag.
+            direct = [d for d in deps if _is_direct_reference(d)]
+            regular = [d for d in deps if d not in direct]
+            if direct:
+                run([*add, *target, "--raw", "--", *direct], build_dir, args.dry_run, args.timeout)
+            if regular:
+                run([*add, *target, *flags, "--", *regular], build_dir, args.dry_run, args.timeout)
+
+        add_all([], specs.main_deps)
         for grp, deps in specs.extras.items():
-            if deps:
-                run([*add, "--optional", grp, *flags, *deps], build_dir, args.dry_run, args.timeout)
+            add_all(["--optional", grp], deps)
         for grp, deps in specs.groups.items():
-            if deps:
-                run([*add, "--group", grp, *flags, *deps], build_dir, args.dry_run, args.timeout)
+            add_all(["--group", grp], deps)
 
         # ---- 5. Dependencies in die ORIGINALE pyproject.toml einmergen ----
         if not args.dry_run:
@@ -1094,11 +1150,11 @@ def build_and_swap(
                 built.get("dependency-groups", {}),
                 new_requires_python,
             )
-            (build_dir / "pyproject.toml").write_text(merged, encoding="utf-8")
+            (build_dir / "pyproject.toml").write_text(merged, encoding=specs.encoding, newline=specs.newline)
 
             # uv.lock im Temp-Verzeichnis wurde bisher gegen die BARE uv-init-Datei
-            # aufgeloest (kein [build-system], keine Version -> virtual/0.1.0). Die
-            # eben gemergte pyproject.toml hat jetzt wieder Version/[build-system]/etc.
+            # aufgeloest (kein [build-system] -> virtual). Die eben gemergte
+            # pyproject.toml hat jetzt wieder [build-system]/etc.
             # aus dem Original -- ohne Neuauflösung hier würde genau diese veraltete
             # Lock-Datei gleich unveraendert ins echte Projekt geswapt.
             run(["uv", "lock"], build_dir, args.dry_run, args.timeout)
