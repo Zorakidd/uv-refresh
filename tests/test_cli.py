@@ -154,6 +154,71 @@ def test_merge_dependencies_adds_groups():
     assert result["dependency-groups"] == {"dev": ["pytest", "ruff"]}
 
 
+def test_merge_dependencies_keeps_comments_in_dependency_lists():
+    # regression test: the lists used to be swapped out wholesale, dropping
+    # every comment in them -- the note above a dependency and the one
+    # between two groups (reported from a real project).
+    original = """\
+[project]
+name = "demo"
+dependencies = [
+    # bcrypt is needed for passphrase-protected OpenSSH keys
+    "asyncssh[bcrypt]>=2.17",
+    "fastapi>=0.115",  # pinned by the API layer
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+# end-to-end tests only
+e2e = [
+    "playwright>=1.45",
+]
+"""
+    merged = cli.merge_dependencies(
+        original,
+        ["asyncssh[bcrypt]>=2.24.0", "fastapi>=0.141.1"],
+        {},
+        {"dev": ["pytest>=9.1.1"], "e2e": ["playwright>=1.63.0"]},
+    )
+    assert merged == original.replace(">=2.17", ">=2.24.0").replace(">=0.115", ">=0.141.1") \
+        .replace(">=8", ">=9.1.1").replace(">=1.45", ">=1.63.0")
+
+
+def test_merge_dependencies_keeps_original_order_and_slots():
+    # uv sorts what it adds; each fresh spec still lands in the slot of the
+    # entry it replaces. The same package with different markers is matched
+    # by marker, even when uv quotes it differently.
+    original = """\
+[project]
+name = "demo"
+dependencies = [
+    "zlib-ng>=0.4",
+    "numpy>=1.26; python_version < '3.12'",  # last numpy with 3.11 wheels
+    "numpy>=2; python_version >= '3.12'",
+    "old-pkg>=1",
+]
+"""
+    merged = cli.merge_dependencies(
+        original,
+        ['numpy>=2.3; python_version >= "3.12"', 'numpy>=1.26.4; python_version < "3.12"',
+         "new-pkg>=1", "zlib-ng>=0.5"],
+        {},
+        {},
+    )
+    assert merged == """\
+[project]
+name = "demo"
+dependencies = [
+    "zlib-ng>=0.5",
+    "numpy>=1.26.4; python_version < \\"3.12\\"",  # last numpy with 3.11 wheels
+    "numpy>=2.3; python_version >= \\"3.12\\"",
+    "new-pkg>=1",
+]
+"""
+
+
 def test_merge_dependencies_removes_groups_that_are_gone():
     # e.g. what --no-groups produces: groups existed before, nothing to put
     # back this time around.

@@ -86,7 +86,10 @@ rewritten. Everything else -- `description`, `readme`, `license`,
 `[build-system]`, `[tool.*]` and so on -- stays unchanged, because it's
 never deleted: the tool only builds a minimal `pyproject.toml` temporarily
 to resolve versions, then takes just the freshly resolved dependency lists
-from it and writes those back into a copy of the original file.
+from it and writes those back into a copy of the original file. Within those
+lists, each entry only gets its new bound in place: comments (above an entry,
+after it, or between two groups) and the order of the entries stay as they
+were.
 
 One exception: with `--no-groups`, any existing
 `optional-dependencies`/`dependency-groups` are intentionally removed (the

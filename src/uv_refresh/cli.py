@@ -63,6 +63,7 @@ from pathlib import Path
 from typing import NoReturn
 
 import tomlkit
+from tomlkit.items import Array
 
 from . import __version__
 
@@ -563,6 +564,80 @@ def _toml_group_table(groups: dict[str, list[str]]):
     return table
 
 
+def _requirement_key(spec: str) -> str:
+    """Same package, extras and markers -- however either side formatted them."""
+    return (strip_version(spec) or spec).lower()
+
+
+def _package_key(spec: str) -> str:
+    parsed = _name_and_bound(spec)
+    return parsed[0] if parsed else spec.lower()
+
+
+def _update_array(arr, new: list[str]) -> None:
+    """Rewrites the tomlkit array 'arr' in place so it holds exactly 'new'.
+
+    Swapping in a freshly built array dropped every comment inside the old
+    one -- a note above a dependency saying why it's there was gone after
+    the first refresh. Instead each fresh spec takes over the slot of the
+    entry it replaces, so comments above it, a trailing comment on its line
+    and the original order all stay. Matched by requirement first, then by
+    package name alone: --drop-extras/--drop-markers change the requirement,
+    and uv may write a marker differently than the original did.
+
+    Old entries without a counterpart (e.g. an include-group, which
+    resolve_groups() expanded) are removed, specs without one appended.
+    """
+    old = list(arr)
+    taken: dict[int, str] = {}  # old index -> fresh spec
+    pending = list(new)
+    for key in (_requirement_key, _package_key):
+        free: dict[str, list[int]] = {}
+        for i, entry in enumerate(old):
+            if isinstance(entry, str) and i not in taken:
+                free.setdefault(key(entry), []).append(i)
+        rest = []
+        for spec in pending:
+            if slots := free.get(key(spec)):
+                taken[slots.pop(0)] = spec
+            else:
+                rest.append(spec)
+        pending = rest
+
+    for i, spec in taken.items():
+        if arr[i] != spec:  # an unchanged entry keeps its exact original text
+            arr[i] = spec
+    for i in reversed(range(len(old))):
+        if i not in taken:
+            del arr[i]
+    for spec in pending:
+        arr.append(spec)
+
+
+def _set_array(parent, key: str, new: list[str]) -> None:
+    if isinstance(parent.get(key), Array):
+        _update_array(parent[key], new)
+    else:
+        parent[key] = _toml_array(new)
+
+
+def _set_group_table(parent, key: str, groups: dict[str, list[str]]) -> None:
+    """Like _set_array, for optional-dependencies/dependency-groups: the table
+    is updated key by key, so comments between the groups stay too."""
+    if not groups:
+        if key in parent:
+            del parent[key]
+        return
+    table = parent.get(key)
+    if not isinstance(table, dict):
+        parent[key] = _toml_group_table(groups)
+        return
+    for grp in [g for g in table if g not in groups]:
+        del table[grp]
+    for grp, specs in groups.items():
+        _set_array(table, grp, specs)
+
+
 def merge_dependencies(
     original_text: str,
     new_deps: list[str],
@@ -580,7 +655,8 @@ def merge_dependencies(
     [project.urls], [project.scripts], [build-system], [tool.*], ... -- wird
     nie angefasst, weil es nie geloescht wurde. tomlkit erhaelt dabei
     Formatierung und Kommentare des Originals, statt es platt neu zu
-    serialisieren.
+    serialisieren -- auch innerhalb der Dependency-Listen, die nur
+    eintragsweise aktualisiert werden (siehe _update_array).
 
     new_requires_python is the one exception to "leave everything but deps
     alone": --full passes it (see build_and_swap) to bump requires-python
@@ -588,20 +664,13 @@ def merge_dependencies(
     requires-python stays whatever the original had.
     """
     doc = tomlkit.parse(original_text)
-    doc["project"]["dependencies"] = _toml_array(new_deps)
+    _set_array(doc["project"], "dependencies", new_deps)
 
     if new_requires_python:
         doc["project"]["requires-python"] = new_requires_python
 
-    if new_extras:
-        doc["project"]["optional-dependencies"] = _toml_group_table(new_extras)
-    elif "optional-dependencies" in doc["project"]:
-        del doc["project"]["optional-dependencies"]
-
-    if new_groups:
-        doc["dependency-groups"] = _toml_group_table(new_groups)
-    elif "dependency-groups" in doc:
-        del doc["dependency-groups"]
+    _set_group_table(doc["project"], "optional-dependencies", new_extras)
+    _set_group_table(doc, "dependency-groups", new_groups)
 
     return tomlkit.dumps(doc)
 
