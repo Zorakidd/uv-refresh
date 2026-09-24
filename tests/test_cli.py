@@ -15,8 +15,7 @@ from uv_refresh import cli
     ("spec", "expected"),
     [
         ("requests>=2.0", "requests"),
-        ('fastapi[standard]>=0.110; python_version<"3.13"',
-         'fastapi[standard]; python_version < "3.13"'),
+        ('fastapi[standard]>=0.110; python_version<"3.13"', 'fastapi[standard]; python_version < "3.13"'),
         ("pkg @ git+https://example.com/repo.git", "pkg @ git+https://example.com/repo.git"),
         ("   ", None),
     ],
@@ -27,8 +26,7 @@ def test_strip_version(spec, expected):
 
 def test_strip_version_drop_extras_and_markers():
     spec = 'fastapi[standard]>=0.110; python_version<"3.13"'
-    assert cli.strip_version(spec, keep_extras=False, keep_markers=True) == \
-        'fastapi; python_version < "3.13"'
+    assert cli.strip_version(spec, keep_extras=False, keep_markers=True) == 'fastapi; python_version < "3.13"'
     assert cli.strip_version(spec, keep_extras=True, keep_markers=False) == "fastapi[standard]"
 
 
@@ -67,8 +65,13 @@ def test_resolve_groups_missing_group():
 def test_build_init_cmd_binds_flags_with_equals():
     cmd = cli.build_init_cmd("demo", ">=3.11", "a description")
     assert cmd == [
-        "uv", "init", "--bare", "--no-workspace",
-        "--name=demo", "--python=>=3.11", "--description=a description",
+        "uv",
+        "init",
+        "--bare",
+        "--no-workspace",
+        "--name=demo",
+        "--python=>=3.11",
+        "--description=a description",
     ]
 
 
@@ -146,9 +149,7 @@ def test_merge_dependencies_bumps_requires_python_when_given():
 
 def test_merge_dependencies_adds_groups():
     original = '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = []\n'
-    merged = cli.merge_dependencies(
-        original, ["click"], {"speed": ["orjson"]}, {"dev": ["pytest", "ruff"]}
-    )
+    merged = cli.merge_dependencies(original, ["click"], {"speed": ["orjson"]}, {"dev": ["pytest", "ruff"]})
     result = tomllib.loads(merged)
     assert result["project"]["optional-dependencies"] == {"speed": ["orjson"]}
     assert result["dependency-groups"] == {"dev": ["pytest", "ruff"]}
@@ -182,14 +183,15 @@ e2e = [
         {},
         {"dev": ["pytest>=9.1.1"], "e2e": ["playwright>=1.63.0"]},
     )
-    assert merged == original.replace(">=2.17", ">=2.24.0").replace(">=0.115", ">=0.141.1") \
-        .replace(">=8", ">=9.1.1").replace(">=1.45", ">=1.63.0")
+    assert merged == original.replace(">=2.17", ">=2.24.0").replace(">=0.115", ">=0.141.1").replace(
+        ">=8", ">=9.1.1"
+    ).replace(">=1.45", ">=1.63.0")
 
 
 def test_merge_dependencies_keeps_original_order_and_slots():
     # uv sorts what it adds; each fresh spec still lands in the slot of the
-    # entry it replaces. The same package with different markers is matched
-    # by marker, even when uv quotes it differently.
+    # entry it replaces, and only its bound changes. uv's output here is what
+    # real uv writes: markers rewritten to python_full_version, ' ; ' spacing.
     original = """\
 [project]
 name = "demo"
@@ -202,33 +204,190 @@ dependencies = [
 """
     merged = cli.merge_dependencies(
         original,
-        ['numpy>=2.3; python_version >= "3.12"', 'numpy>=1.26.4; python_version < "3.12"',
-         "new-pkg>=1", "zlib-ng>=0.5"],
+        [
+            "new-pkg>=1",
+            "numpy>=1.26.4 ; python_full_version < '3.12'",
+            "numpy>=2.3 ; python_full_version >= '3.12'",
+            "zlib-ng>=0.5",
+        ],
         {},
         {},
     )
-    assert merged == """\
+    assert (
+        merged
+        == """\
 [project]
 name = "demo"
 dependencies = [
     "zlib-ng>=0.5",
-    "numpy>=1.26.4; python_version < \\"3.12\\"",  # last numpy with 3.11 wheels
-    "numpy>=2.3; python_version >= \\"3.12\\"",
+    "numpy>=1.26.4; python_version < '3.12'",  # last numpy with 3.11 wheels
+    "numpy>=2.3; python_version >= '3.12'",
     "new-pkg>=1",
 ]
 """
+    )
 
 
-@pytest.mark.parametrize("from_uv", ["priv", "priv @ https://example.com/priv-1.0-py3-none-any.whl"])
-def test_merge_dependencies_keeps_direct_references_verbatim(from_uv):
+def test_merge_dependencies_matches_same_package_entries_by_what_their_marker_means():
+    # regression test: matched by package name alone, in uv's (sorted) order,
+    # the two numpy entries swapped places -- and each comment ended up on
+    # the other entry (reproduced against real uv)
+    original = """\
+[project]
+name = "demo"
+dependencies = [
+    "numpy>=2; python_version >= '3.12'",  # modern line
+    "numpy>=1.26; python_version < '3.12'",  # last numpy with 3.11 wheels
+]
+"""
+    merged = cli.merge_dependencies(
+        original,
+        ["numpy>=1.26.4 ; python_full_version < '3.12'", "numpy>=2.3 ; python_full_version >= '3.12'"],
+        {},
+        {},
+    )
+    assert merged == original.replace(">=2;", ">=2.3;").replace(">=1.26;", ">=1.26.4;")
+
+
+def test_merge_dependencies_never_trades_a_registry_entry_for_a_direct_reference():
+    # regression test: pass 2 paired the registry entry's slot with uv's
+    # direct reference and the other way around; the direct reference's slot
+    # kept its text, so the file ended up with the URL twice and the
+    # registry dependency for Python < 3.12 gone (reproduced against real uv)
+    wheel = "https://example.com/priv-1.0-py3-none-any.whl"
+    original = (
+        '[project]\nname = "demo"\ndependencies = [\n'
+        "    \"priv>=1.0 ; python_version < '3.12'\",\n"
+        f"    \"priv @ {wheel} ; python_version >= '3.12'\",\n"
+        "]\n"
+    )
+    merged = cli.merge_dependencies(
+        original,
+        [f"priv @ {wheel} ; python_full_version >= '3.12'", "priv>=2.3.0 ; python_full_version < '3.12'"],
+        {},
+        {},
+    )
+    assert merged == original.replace("priv>=1.0", "priv>=2.3.0")
+
+
+@pytest.mark.parametrize(
+    ("original", "from_uv", "expected"),
+    [
+        # uv's own spelling of the name and marker stays out of the file
+        ("Typing_Extensions>=4.0", "typing-extensions>=4.16.0", "Typing_Extensions>=4.16.0"),
+        (
+            "pkg>=1; python_version > '3.10'",
+            "pkg>=2 ; python_full_version >= '3.11'",
+            "pkg>=2; python_version > '3.10'",
+        ),
+        # no bound yet: it goes after the name/extras, not after the space before the marker
+        (
+            "numpy ; python_version<'3.13'",
+            "numpy>=2.3.0 ; python_full_version < '3.13'",
+            "numpy>=2.3.0 ; python_version<'3.13'",
+        ),
+        ("fastapi[standard]", "fastapi[standard]>=0.141.1", "fastapi[standard]>=0.141.1"),
+        # the same bound, only spaced differently: the entry isn't touched at all
+        ("requests >= 2.32.0", "requests>=2.32.0", "requests >= 2.32.0"),
+        # --raw: the bound goes away, the rest stays
+        ("requests>=2.0 ; os_name == 'nt'", "requests ; os_name == 'nt'", "requests ; os_name == 'nt'"),
+        ("requests (>=2.0)", "requests>=2.32.0", "requests >=2.32.0"),
+        ("pkg>=1,<2", "pkg>=1.5.0,<2.0.0", "pkg>=1.5.0,<2.0.0"),
+    ],
+)
+def test_merge_dependencies_only_swaps_the_bound(original, from_uv, expected):
+    merged = cli.merge_dependencies(
+        f'[project]\nname = "demo"\ndependencies = ["{original}"]\n', [from_uv], {}, {}
+    )
+    assert tomllib.loads(merged)["project"]["dependencies"] == [expected]
+
+
+def test_merge_dependencies_takes_uvs_text_for_what_a_drop_flag_changed():
+    # --drop-markers: two numpy entries became one plain 'numpy' -- that change
+    # is the point, so uv's text replaces the first and the second goes
+    original = (
+        '[project]\nname = "demo"\ndependencies = [\n'
+        "    \"numpy>=1.26; python_version < '3.12'\",\n"
+        "    \"numpy>=2; python_version >= '3.12'\",\n"
+        "]\n"
+    )
+    merged = cli.merge_dependencies(original, ["numpy>=2.3"], {}, {})
+    assert tomllib.loads(merged)["project"]["dependencies"] == ["numpy>=2.3"]
+
+
+def test_merge_dependencies_keeps_literal_strings_literal():
+    original = """[project]\nname = "demo"\ndependencies = ['numpy>=1; python_version < "3.12"']\n"""
+    merged = cli.merge_dependencies(original, ["numpy>=2 ; python_full_version < '3.12'"], {}, {})
+    assert merged == original.replace(">=1", ">=2")
+
+
+def test_merge_dependencies_keeps_include_groups():
+    # regression test: resolve_groups() expands an include-group for uv, and
+    # the merge wrote the expansion back -- the include-group was replaced by
+    # a copy of the other group's packages, which then drifted apart from it
+    original = """\
+[project]
+name = "demo"
+dependencies = ["a>=1"]
+
+[dependency-groups]
+test = ["pytest>=8"]
+dev = [
+    {include-group = "test"},  # shared test tooling
+    "ruff>=0.5",
+]
+"""
+    merged = cli.merge_dependencies(
+        original, ["a>=2"], {}, {"test": ["pytest>=9"], "dev": ["pytest>=9", "ruff>=0.6"]}
+    )
+    assert merged == original.replace("a>=1", "a>=2").replace(">=8", ">=9").replace(">=0.5", ">=0.6")
+
+
+def test_merge_dependencies_follows_nested_include_groups():
+    original = (
+        '[project]\nname = "demo"\ndependencies = []\n'
+        '[dependency-groups]\nlint = ["ruff>=0.5"]\n'
+        'test = [{include-group = "lint"}, "pytest>=8"]\n'
+        'dev = [{include-group = "test"}, "ipython>=8"]\n'
+    )
+    merged = cli.merge_dependencies(
+        original,
+        [],
+        {},
+        {
+            "lint": ["ruff>=0.6"],
+            "test": ["pytest>=9", "ruff>=0.6"],
+            "dev": ["ipython>=9", "pytest>=9", "ruff>=0.6"],
+        },
+    )
+    assert tomllib.loads(merged)["dependency-groups"] == {
+        "lint": ["ruff>=0.6"],
+        "test": [{"include-group": "lint"}, "pytest>=9"],
+        "dev": [{"include-group": "test"}, "ipython>=9"],
+    }
+
+
+_WHEEL_URL = "https://example.com/priv-1.0-py3-none-any.whl"
+
+
+@pytest.mark.parametrize(
+    "original_spec",
+    [
+        f"priv@{_WHEEL_URL}",
+        # regression test: packaging rejects this spelling (PEP 508 wants a
+        # space before the ';'), uv accepts it -- the entry wasn't recognised
+        # as a direct reference at all, and a bare 'priv' took its place
+        f"priv @ {_WHEEL_URL}; sys_platform == 'linux'",
+        f"priv@{_WHEEL_URL};sys_platform == 'linux'",
+    ],
+)
+@pytest.mark.parametrize("from_uv", ["priv", "priv @ {url} ; sys_platform == 'linux'", "priv @ {url}"])
+def test_merge_dependencies_keeps_direct_references_verbatim(original_spec, from_uv):
     # regression test: uv writes a direct reference back as a bare 'priv'
     # (URL moved to [tool.uv.sources], never merged) -- which then resolved
     # from PyPI -- or at best respaced. Either way the original text stays.
-    original = (
-        '[project]\nname = "demo"\n'
-        'dependencies = ["priv@https://example.com/priv-1.0-py3-none-any.whl", "a>=1"]\n'
-    )
-    merged = cli.merge_dependencies(original, [from_uv, "a>=2"], {}, {})
+    original = f'[project]\nname = "demo"\ndependencies = ["{original_spec}", "a>=1"]\n'
+    merged = cli.merge_dependencies(original, [from_uv.format(url=_WHEEL_URL), "a>=2"], {}, {})
     assert merged == original.replace("a>=1", "a>=2")
 
 
@@ -245,9 +404,9 @@ def test_merge_dependencies_removes_groups_that_are_gone():
 
 
 def test_run_raises_on_timeout(tmp_path):
-    with pytest.raises(RuntimeError, match="ran longer than"):
-        cli.run([sys.executable, "-c", "import time; time.sleep(2)"], tmp_path,
-                dry=False, timeout=0.1)
+    # the real value, not rounded: '0.1' used to read 'longer than 0s'
+    with pytest.raises(RuntimeError, match=r"ran longer than 0\.1s"):
+        cli.run([sys.executable, "-c", "import time; time.sleep(2)"], tmp_path, dry=False, timeout=0.1)
 
 
 def test_run_dry_run_never_executes(tmp_path):
@@ -302,12 +461,35 @@ def test_ensure_backup_ignored_also_ignores_the_temp_build_dir(tmp_path):
     assert lines == [".uv-refresh-backup/", ".uv-refresh-tmp-*/"]
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_ensure_backup_ignored_leaves_a_subproject_alone_when_the_repo_already_ignores_it(tmp_path):
+    # regression test: every subproject of a monorepo got its own .gitignore
+    # (and a warning), even with both patterns in the repo's root .gitignore
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / ".gitignore").write_text(".uv-refresh-backup/\n.uv-refresh-tmp-*/\n", encoding="utf-8")
+    root = tmp_path / "packages" / "demo"
+    root.mkdir(parents=True)
+
+    cli.ensure_backup_ignored(root)
+
+    assert not (root / ".gitignore").exists()
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_ensure_backup_ignored_adds_only_what_the_repo_does_not_ignore_yet(tmp_path):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / ".gitignore").write_text(".uv-refresh-backup/\n", encoding="utf-8")
+    root = tmp_path / "packages" / "demo"
+    root.mkdir(parents=True)
+
+    cli.ensure_backup_ignored(root)
+
+    assert (root / ".gitignore").read_text(encoding="utf-8").splitlines() == [".uv-refresh-tmp-*/"]
+
+
 def test_main_dry_run_leaves_project_untouched(tmp_path, monkeypatch):
     pyproject = tmp_path / "pyproject.toml"
-    original = (
-        '[project]\nname = "demo"\nversion = "1.0.0"\n'
-        'dependencies = ["requests>=2.0"]\n'
-    )
+    original = '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n'
     pyproject.write_text(original, encoding="utf-8")
     monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
     monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--dry-run"])
@@ -329,7 +511,8 @@ def _stub_run_writing(resolved_pyproject_text, calls=None):
             calls.append(cmd)
         if cmd[:2] == ["uv", "init"]:
             (cwd / "pyproject.toml").write_text(
-                '[project]\nname = "demo"\nversion = "0.0.0"\n', encoding="utf-8")
+                '[project]\nname = "demo"\nversion = "0.0.0"\n', encoding="utf-8"
+            )
         elif cmd[:2] == ["uv", "add"]:
             (cwd / "pyproject.toml").write_text(resolved_pyproject_text, encoding="utf-8")
 
@@ -345,10 +528,13 @@ def test_main_success_swaps_pyproject_and_lock(tmp_path, monkeypatch):
     original = '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n'
     pyproject.write_text(original, encoding="utf-8")
 
-    monkeypatch.setattr(cli, "run", _stub_run_writing(
-        '[project]\nname = "demo"\nversion = "0.0.0"\n'
-        'dependencies = ["requests==2.31.0"]\n'
-    ))
+    monkeypatch.setattr(
+        cli,
+        "run",
+        _stub_run_writing(
+            '[project]\nname = "demo"\nversion = "0.0.0"\ndependencies = ["requests==2.31.0"]\n'
+        ),
+    )
     monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
     monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes"])
 
@@ -384,14 +570,15 @@ def test_main_copies_python_version_and_sources_into_temp_build(tmp_path, monkey
     def fake_run(cmd, cwd, dry, timeout=None):
         if cmd[:2] == ["uv", "init"]:
             (cwd / "pyproject.toml").write_text(
-                '[project]\nname = "demo"\nversion = "0.0.0"\n', encoding="utf-8")
+                '[project]\nname = "demo"\nversion = "0.0.0"\n', encoding="utf-8"
+            )
         elif cmd[:2] == ["uv", "add"]:
             seen_at_add["python_version"] = (cwd / ".python-version").read_text(encoding="utf-8")
-            seen_at_add["pyproject"] = tomllib.loads(
-                (cwd / "pyproject.toml").read_text(encoding="utf-8"))
+            seen_at_add["pyproject"] = tomllib.loads((cwd / "pyproject.toml").read_text(encoding="utf-8"))
             (cwd / "pyproject.toml").write_text(
-                '[project]\nname = "demo"\nversion = "0.0.0"\n'
-                'dependencies = ["torch==2.5.1"]\n', encoding="utf-8")
+                '[project]\nname = "demo"\nversion = "0.0.0"\ndependencies = ["torch==2.5.1"]\n',
+                encoding="utf-8",
+            )
 
     monkeypatch.setattr(cli, "run", fake_run)
     monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
@@ -414,7 +601,7 @@ def test_build_adds_without_syncing_and_with_the_projects_uv_config(tmp_path, mo
         '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n\n'
         '[dependency-groups]\ndev = ["pytest>=8"]\n\n'
         '[tool.uv]\nconstraint-dependencies = ["requests<3"]\n\n'
-        '[tool.ruff]\nline-length = 100\n',
+        "[tool.ruff]\nline-length = 100\n",
         encoding="utf-8",
     )
     seen = []  # (uv add command, the build pyproject.toml as that command found it)
@@ -422,7 +609,8 @@ def test_build_adds_without_syncing_and_with_the_projects_uv_config(tmp_path, mo
     def fake_run(cmd, cwd, dry, timeout=None):
         if cmd[:2] == ["uv", "init"]:
             (cwd / "pyproject.toml").write_text(
-                '[project]\nname = "demo"\nversion = "0.0.0"\ndependencies = []\n', encoding="utf-8")
+                '[project]\nname = "demo"\nversion = "0.0.0"\ndependencies = []\n', encoding="utf-8"
+            )
         elif cmd[:2] == ["uv", "add"]:
             seen.append((cmd, tomllib.loads((cwd / "pyproject.toml").read_text(encoding="utf-8"))))
 
@@ -450,12 +638,21 @@ def _main_add_calls(tmp_path, monkeypatch, pyproject_text):
     return [c for c in calls if c[:2] == ["uv", "add"]]
 
 
-def test_build_adds_direct_references_first_and_raw(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "wheel",
+    [
+        "priv @ https://example.com/priv-1.0-py3-none-any.whl",
+        # regression test: invalid PEP 508 (no space before ';'), but uv takes
+        # it -- it went to uv without --raw, and the URL got lost
+        "priv @ https://example.com/priv-1.0-py3-none-any.whl; sys_platform == 'linux'",
+    ],
+)
+def test_build_adds_direct_references_first_and_raw(tmp_path, monkeypatch, wheel):
     # without --raw, uv moves the URL into [tool.uv.sources], which the merge
     # never carries back; first, since a regular dependency may need them.
-    wheel = "priv @ https://example.com/priv-1.0-py3-none-any.whl"
     adds = _main_add_calls(
-        tmp_path, monkeypatch,
+        tmp_path,
+        monkeypatch,
         '[project]\nname = "demo"\nversion = "1.0.0"\n'
         f'dependencies = ["a>=1", "{wheel}", "b>=1"]\n\n'
         '[dependency-groups]\ndev = ["pytest>=8"]\n',
@@ -471,11 +668,149 @@ def test_build_never_hands_a_dependency_to_uv_as_an_option(tmp_path, monkeypatch
     # an invalid entry containing '@' is passed on as-is (see strip_version)
     # -- without '--', uv took this one as its own --index-url flag.
     adds = _main_add_calls(
-        tmp_path, monkeypatch,
+        tmp_path,
+        monkeypatch,
         '[project]\nname = "demo"\nversion = "1.0.0"\n'
         'dependencies = ["--index-url=https://evil.example/@x"]\n',
     )
     assert adds == [["uv", "add", "--no-sync", "--", "--index-url=https://evil.example/@x"]]
+
+
+def test_specs_from_only_calls_real_direct_references_so(capsys):
+    specs = cli.specs_from(
+        ["--index-url=https://evil.example/@x", "priv @ https://example.com/p.whl; os_name == 'nt'"],
+        True,
+        True,
+    )
+    err = capsys.readouterr().err
+    assert len(specs) == 2
+    assert "--index-url=https://evil.example/@x: direct reference" not in err
+    assert "priv @ https://example.com/p.whl; os_name == 'nt': direct reference, left unchanged" in err
+
+
+def test_main_says_so_when_it_fails_after_the_swap(tmp_path, monkeypatch, capsys):
+    # regression test: the change report ran after the swap but inside the
+    # error handling -- a Ctrl+C there read 'pyproject.toml unchanged' for a
+    # file that had already been replaced (reproduced)
+    pyproject = tmp_path / "pyproject.toml"
+    original = '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n'
+    pyproject.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(cli, "run", _stub_run_writing(original.replace(">=2.0", ">=2.32.0")))
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes"])
+    real = cli.build_and_swap
+
+    def interrupted_after_swap(*args, **kwargs):
+        real(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "build_and_swap", interrupted_after_swap)
+
+    assert cli.main() == 1
+    err = capsys.readouterr().err
+    assert "already replaced" in err
+    assert "unchanged" not in err
+    assert ">=2.32.0" in pyproject.read_text(encoding="utf-8")
+
+
+def test_main_reports_changes_only_once_the_run_succeeded(tmp_path, monkeypatch, capsys):
+    pyproject = tmp_path / "pyproject.toml"
+    original = '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n'
+    pyproject.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(cli, "run", _stub_run_writing(original.replace(">=2.0", ">=2.32.0")))
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes"])
+
+    assert cli.main() == 0
+    out = capsys.readouterr().out
+    assert out.index(">=2.0 -> >=2.32.0") < out.index("Done.")
+
+
+def _locked_temp_build(monkeypatch, unlock_after=None):
+    """Makes shutil.rmtree fail on the temp build, the way Windows refuses
+    while a killed uv still holds it -- for good, or for the first
+    'unlock_after' tries. Returns the list of tries made."""
+    real_rmtree, tries = shutil.rmtree, []
+
+    def rmtree(path, ignore_errors=False, **kwargs):
+        if ".uv-refresh-tmp-" not in str(path):
+            return real_rmtree(path, ignore_errors=ignore_errors, **kwargs)
+        tries.append(path)
+        if unlock_after is not None and len(tries) > unlock_after:
+            return real_rmtree(path, ignore_errors=ignore_errors, **kwargs)
+        return None  # 'ignore_errors': the directory simply stays
+
+    monkeypatch.setattr(cli.shutil, "rmtree", rmtree)
+    monkeypatch.setattr(cli.time, "sleep", lambda _s: None)
+    return tries
+
+
+def _main_with_stub(tmp_path, monkeypatch, fail=False):
+    original = '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n'
+    (tmp_path / "pyproject.toml").write_text(original, encoding="utf-8")
+    stub = _stub_run_writing(original.replace(">=2.0", ">=2.32.0"))
+
+    def run(cmd, cwd, dry, timeout=None):
+        if fail and cmd[:2] == ["uv", "add"]:
+            raise RuntimeError("Command ran longer than 0.05s and was aborted: uv add")
+        stub(cmd, cwd, dry, timeout)
+
+    monkeypatch.setattr(cli, "run", run)
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes"])
+    return cli.main()
+
+
+def test_main_warns_about_a_temp_build_it_could_not_remove(tmp_path, monkeypatch, capsys):
+    # a leftover temp build must not fail a refresh that already landed
+    tries = _locked_temp_build(monkeypatch)
+
+    assert _main_with_stub(tmp_path, monkeypatch) == 0
+    assert len(tries) == cli._CLEANUP_ATTEMPTS
+    assert "could not remove the temp build" in capsys.readouterr().err
+
+
+def test_main_failure_keeps_its_own_error_and_reports_a_leftover_temp_build(tmp_path, monkeypatch, capsys):
+    # regression test: on Windows, the uv --timeout killed still held the temp
+    # build -- its removal failed with '[WinError 32]', which replaced the
+    # timeout message (reproduced); ignoring that instead left the directory
+    # behind without a word
+    _locked_temp_build(monkeypatch)
+
+    assert _main_with_stub(tmp_path, monkeypatch, fail=True) == 1
+    err = capsys.readouterr().err
+    assert "Command ran longer than 0.05s" in err
+    assert "could not remove the temp build" in err
+    assert "pyproject.toml unchanged" in err
+
+
+def test_main_retries_a_temp_build_that_is_only_briefly_locked(tmp_path, monkeypatch, capsys):
+    tries = _locked_temp_build(monkeypatch, unlock_after=3)
+
+    assert _main_with_stub(tmp_path, monkeypatch, fail=True) == 1
+    assert len(tries) == 4
+    assert "could not remove the temp build" not in capsys.readouterr().err
+    assert not list(tmp_path.glob(".uv-refresh-tmp-*"))
+
+
+def test_replaced_since_without_a_backup_is_false(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("x", encoding="utf-8")
+    assert cli._replaced_since(tmp_path / "pyproject.toml", tmp_path / "no-backup") is False
+
+
+def test_main_verbose_prints_no_bom(tmp_path, monkeypatch, capsys):
+    # regression test: the kept BOM was printed as U+FEFF, which crashed the
+    # finished run on a console that can't encode it (Windows cp1252, redirected)
+    text = '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["requests>=2.0"]\n'
+    (tmp_path / "pyproject.toml").write_bytes(b"\xef\xbb\xbf" + text.encode())
+    monkeypatch.setattr(cli, "run", _stub_run_writing(text.replace(">=2.0", ">=2.32.0")))
+    monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes", "--verbose"])
+
+    assert cli.main() == 0
+    out = capsys.readouterr().out
+    assert "﻿" not in out
+    assert 'dependencies = ["requests>=2.32.0"]' in out
 
 
 @pytest.mark.parametrize(("bom", "newline"), [(False, "\n"), (True, "\n"), (False, "\r\n"), (True, "\r\n")])
@@ -519,9 +854,13 @@ def _run_main_full(tmp_path, monkeypatch, requires_python, latest):
         encoding="utf-8",
     )
     calls = []
-    monkeypatch.setattr(cli, "run", _stub_run_writing(
-        '[project]\nname = "demo"\nversion = "0.0.0"\ndependencies = ["requests==2.31.0"]\n', calls
-    ))
+    monkeypatch.setattr(
+        cli,
+        "run",
+        _stub_run_writing(
+            '[project]\nname = "demo"\nversion = "0.0.0"\ndependencies = ["requests==2.31.0"]\n', calls
+        ),
+    )
     monkeypatch.setattr(cli, "latest_installed_python", lambda: latest)
     monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
     monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes", "--full"])
@@ -771,7 +1110,8 @@ def test_main_failure_leaves_pyproject_untouched(tmp_path, monkeypatch):
     def failing_run(cmd, cwd, dry, timeout=None):
         if cmd[:2] == ["uv", "init"]:
             (cwd / "pyproject.toml").write_text(
-                '[project]\nname = "demo"\nversion = "0.0.0"\n', encoding="utf-8")
+                '[project]\nname = "demo"\nversion = "0.0.0"\n', encoding="utf-8"
+            )
         else:
             raise RuntimeError("Command failed: uv add (simulated network error)")
 
@@ -894,12 +1234,15 @@ def test_main_success_prunes_old_backups(tmp_path, monkeypatch):
     for s in ["20200101-000000", "20200102-000000", "20200103-000000"]:
         (backup_base / s).mkdir(parents=True)
 
-    monkeypatch.setattr(cli, "run", _stub_run_writing(
-        '[project]\nname = "demo"\nversion = "0.0.0"\ndependencies = ["requests==2.31.0"]\n'
-    ))
+    monkeypatch.setattr(
+        cli,
+        "run",
+        _stub_run_writing(
+            '[project]\nname = "demo"\nversion = "0.0.0"\ndependencies = ["requests==2.31.0"]\n'
+        ),
+    )
     monkeypatch.setattr(cli.shutil, "which", lambda _cmd: "/usr/bin/uv")
-    monkeypatch.setattr(sys, "argv",
-                         ["uv-refresh", "--path", str(tmp_path), "--yes", "--keep-backups", "2"])
+    monkeypatch.setattr(sys, "argv", ["uv-refresh", "--path", str(tmp_path), "--yes", "--keep-backups", "2"])
 
     assert cli.main() == 0
     assert len(list(backup_base.iterdir())) == 2
@@ -935,10 +1278,44 @@ def test_restrict_to_owner_uses_icacls_on_windows(tmp_path, monkeypatch, capsys)
     assert "could not restrict" not in capsys.readouterr().err
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="icacls is Windows-only")
+# pytest turns the reader thread's exception into this warning instead of
+# letting it print -- so the warning is what has to fail the test
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
+def test_restrict_to_owner_is_quiet_for_a_path_with_umlauts(tmp_path, capfd):
+    # regression test: icacls answers in the OEM code page, text=True decoded
+    # that as ANSI -- 'ü' is 0x81 in cp850/cp437 and nothing in cp1252, and
+    # the reader thread printed a UnicodeDecodeError traceback on every run
+    # from a path like C:\Users\Jürgen\... (reproduced)
+    backup = tmp_path / "Jürgen Müller"
+    backup.mkdir()
+
+    cli.restrict_to_owner(backup)
+
+    out, err = capfd.readouterr()
+    assert "Traceback" not in out + err
+    assert "could not restrict" not in err
+
+
+def test_latest_installed_python_reads_uvs_output_as_utf8(monkeypatch):
+    # uv writes UTF-8; the locale's code page (cp1252 on Windows) garbled the
+    # interpreter paths in its JSON and failed on some ('Á' is C3 81 in UTF-8)
+    seen = {}
+    payload = '[{"version": "3.13.5", "path": "C:/Ágnes/python.exe"}]'
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout=payload)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    assert cli.latest_installed_python() == "3.13.5"
+    assert seen.get("encoding") == "utf-8"
+
+
 def test_restrict_to_owner_warns_when_icacls_fails(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(cli.subprocess, "run",
-                         lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1))
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1))
 
     cli.restrict_to_owner(tmp_path)
 
@@ -961,7 +1338,8 @@ def test_restrict_to_owner_warns_when_icacls_hangs(tmp_path, monkeypatch, capsys
 def test_latest_installed_python_picks_first_entry(monkeypatch):
     payload = '[{"version": "3.13.5"}, {"version": "3.11.14"}]'
     monkeypatch.setattr(
-        cli.subprocess, "run",
+        cli.subprocess,
+        "run",
         lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout=payload),
     )
     assert cli.latest_installed_python() == "3.13.5"
@@ -980,7 +1358,8 @@ def test_latest_installed_python_skips_prereleases(monkeypatch, payload, expecte
     # package (uv offers cpython-3.15.0rc2 right now, and its JSON gives the
     # version exactly like that: '3.15.0rc2').
     monkeypatch.setattr(
-        cli.subprocess, "run",
+        cli.subprocess,
+        "run",
         lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout=payload),
     )
     assert cli.latest_installed_python() == expected
@@ -988,7 +1367,8 @@ def test_latest_installed_python_skips_prereleases(monkeypatch, payload, expecte
 
 def test_latest_installed_python_returns_none_on_failure(monkeypatch):
     monkeypatch.setattr(
-        cli.subprocess, "run",
+        cli.subprocess,
+        "run",
         lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 1, stdout=""),
     )
     assert cli.latest_installed_python() is None
@@ -1001,7 +1381,8 @@ def test_latest_installed_python_returns_none_on_timeout(monkeypatch):
 
 def test_latest_installed_python_returns_none_when_nothing_installed(monkeypatch):
     monkeypatch.setattr(
-        cli.subprocess, "run",
+        cli.subprocess,
+        "run",
         lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="[]"),
     )
     assert cli.latest_installed_python() is None
@@ -1016,17 +1397,17 @@ def test_requires_python_floor_truncates_to_major_minor():
     [
         (">=3.11", "3.14.7", ">=3.14"),
         ("", "3.14.7", ">=3.14"),
-        ("<3.13", "3.14.7", ">=3.14"),         # no floor at all
+        ("<3.13", "3.14.7", ">=3.14"),  # no floor at all
         (">=3.10,<3.13", "3.14.7", ">=3.14"),
-        (">=3.14", "3.14.7", None),            # already there -- no churn
-        (">=3.14.0", "3.14.7", None),          # same (3.14.0 == 3.14)
-        (">=3.14.2", "3.14.7", None),          # '>=3.14' would loosen it
-        (">3.14", "3.14.7", None),             # same
-        ("~=3.14", "3.14.7", None),            # '~=' and '==X.*' floor too
+        (">=3.14", "3.14.7", None),  # already there -- no churn
+        (">=3.14.0", "3.14.7", None),  # same (3.14.0 == 3.14)
+        (">=3.14.2", "3.14.7", None),  # '>=3.14' would loosen it
+        (">3.14", "3.14.7", None),  # same
+        ("~=3.14", "3.14.7", None),  # '~=' and '==X.*' floor too
         ("==3.14.*", "3.14.7", None),
-        (">=3.12,>=3.14.2", "3.14.7", None),   # the highest floor counts
-        (">=3.15", "3.14.7", None),            # would LOWER it
-        ("===3.15.0", "3.14.7", None),         # same, via arbitrary equality
+        (">=3.12,>=3.14.2", "3.14.7", None),  # the highest floor counts
+        (">=3.15", "3.14.7", None),  # would LOWER it
+        ("===3.15.0", "3.14.7", None),  # same, via arbitrary equality
     ],
 )
 def test_bumped_requires_python_only_ever_raises(requires_python, version, expected):
@@ -1036,15 +1417,15 @@ def test_bumped_requires_python_only_ever_raises(requires_python, version, expec
 @pytest.mark.parametrize(
     ("requires_python", "latest", "expected"),
     [
-        (">=3.11", "3.14.7", (">=3.14", "3.14.7")),     # bump + pin
+        (">=3.11", "3.14.7", (">=3.14", "3.14.7")),  # bump + pin
         (None, "3.14.7", (">=3.14", "3.14.7")),
         (">=3.10,<3.13", "3.14.7", (">=3.14", "3.14.7")),  # old cap doesn't block a bump
-        (">=3.14", "3.14.7", (None, "3.14.7")),          # keep + pin
+        (">=3.14", "3.14.7", (None, "3.14.7")),  # keep + pin
         ("==3.14.*", "3.14.7", (None, "3.14.7")),
-        (">=3.15", "3.14.7", (None, None)),              # older than the floor
-        ("==3.13", "3.13.5", (None, None)),              # kept, but excludes 3.13.5
-        (">=3.11.*", "3.14.7", (None, None)),            # can't parse -> don't guess
-        (">=3.11", None, (None, None)),                  # nothing installed
+        (">=3.15", "3.14.7", (None, None)),  # older than the floor
+        ("==3.13", "3.13.5", (None, None)),  # kept, but excludes 3.13.5
+        (">=3.11.*", "3.14.7", (None, None)),  # can't parse -> don't guess
+        (">=3.11", None, (None, None)),  # nothing installed
     ],
 )
 def test_plan_full(monkeypatch, requires_python, latest, expected):
@@ -1160,12 +1541,15 @@ def test_main_full_runs_build_then_pin_with_latest_version(tmp_path, monkeypatch
 
     order = []
     monkeypatch.setattr(
-        cli, "build_and_swap",
-        lambda root, pyproject, lock, backup, original_text, specs, args, new_requires_python, pin_python:
-            order.append(("build", new_requires_python, pin_python)),
+        cli,
+        "build_and_swap",
+        lambda root, pyproject, lock, backup, original_text, specs, args, new_requires_python, pin_python: (
+            order.append(("build", new_requires_python, pin_python))
+        ),
     )
     monkeypatch.setattr(
-        cli, "refresh_python_version",
+        cli,
+        "refresh_python_version",
         lambda root, dry, version: order.append(("refresh", version)),
     )
 
@@ -1227,6 +1611,66 @@ def test_name_and_bound(spec, expected):
     assert cli._name_and_bound(spec) == expected
 
 
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "pkg @ https://example.com/x.whl; os_name == 'nt'",
+        "pkg@https://example.com/x.whl;os_name == 'nt'",
+        "pkg[extra] @ git+https://example.com/r.git@v1; python_version >= '3.12'",
+    ],
+)
+def test_direct_references_packaging_rejects_are_still_direct_references(spec):
+    # regression test: packaging wants a space before a ';' after a URL, uv
+    # doesn't -- None here sent the entry to uv without --raw, and its URL was
+    # replaced by a bare, PyPI-resolved 'pkg' (reproduced against real uv)
+    assert cli._is_direct_reference(spec)
+    parsed = cli._name_and_bound(spec)
+    assert parsed is not None
+    assert parsed[0] == "pkg"
+
+
+def test_parse_entry_normalizes_what_matching_compares():
+    a = cli._parse_entry("Fast_API[Standard,all] >= 0.110 ; python_version<'3.13'")
+    b = cli._parse_entry('fast-api[all,standard]>=0.110; python_version < "3.13"')
+    assert (
+        a == b == cli._Entry("fast-api", frozenset({"standard", "all"}), ">=0.110", 'python_version < "3.13"')
+    )
+
+
+@pytest.mark.parametrize(
+    ("original", "from_uv"),
+    [
+        # what real uv writes for these (see the integration tests)
+        ("python_version < '3.12'", "python_full_version < '3.12'"),
+        ("python_version > '3.10'", "python_full_version >= '3.11'"),
+        ("python_version == '3.11'", "python_full_version == '3.11.*'"),
+        (
+            "python_version <= '3.11' and sys_platform == 'win32'",
+            "python_full_version < '3.12' and sys_platform == 'win32'",
+        ),
+    ],
+)
+def test_marker_signature_sees_through_uvs_rewrite(original, from_uv):
+    assert cli._marker_signature(original) == cli._marker_signature(from_uv) is not None
+
+
+@pytest.mark.parametrize(
+    ("a", "b"),
+    [
+        ("python_version < '3.12'", "python_version >= '3.12'"),
+        ("sys_platform == 'linux'", "sys_platform == 'darwin'"),
+        ("platform_machine == 'arm64'", "platform_machine == 'x86_64'"),
+        ("implementation_name == 'pypy'", None),
+    ],
+)
+def test_marker_signature_tells_different_markers_apart(a, b):
+    assert cli._marker_signature(a) != cli._marker_signature(b)
+
+
+def test_marker_signature_gives_up_on_what_it_cannot_evaluate():
+    assert cli._marker_signature("not a marker") is None
+
+
 def test_collect_bounds_spans_every_section():
     data = tomllib.loads(
         '[project]\nname = "d"\ndependencies = ["a>=1"]\n'
@@ -1234,15 +1678,15 @@ def test_collect_bounds_spans_every_section():
         '[dependency-groups]\ndev = ["c"]\n'
     )
     assert cli.collect_bounds(data) == {
-        ("dependencies", "a"): ">=1",
-        ("optional [web]", "b"): "==2",
-        ("group [dev]", "c"): "",
+        ("dependencies", "a"): (">=1",),
+        ("optional [web]", "b"): ("==2",),
+        ("group [dev]", "c"): ("",),
     }
 
 
 def test_collect_bounds_ignores_non_string_entries():
     data = {"dependency-groups": {"dev": [{"include-group": "other"}, "a>=1"]}}
-    assert cli.collect_bounds(data) == {("group [dev]", "a"): ">=1"}
+    assert cli.collect_bounds(data) == {("group [dev]", "a"): (">=1",)}
 
 
 def test_report_changes_lists_every_moved_bound(capsys):
@@ -1273,13 +1717,55 @@ def test_report_changes_names_removed_dependencies(capsys):
 
     cli.report_changes(old, new)
 
-    assert "removed : b" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "removed : b" in out
+    # regression test: next to a removal, nothing was said about the bounds at all
+    assert "No bounds changed -- 1 dependency already current." in out
 
 
 def test_report_changes_stays_silent_on_unparseable_toml(capsys):
     cli.report_changes("[project", '[project]\nname = "d"\n')
 
     assert capsys.readouterr().out == ""
+
+
+def test_report_changes_sees_every_entry_of_a_package_listed_twice(capsys):
+    # regression test: keyed by (section, name), the second numpy entry
+    # overwrote the first, so a move in the first read 'No bounds changed'
+    old = (
+        '[project]\nname="d"\ndependencies=[\n'
+        "  \"numpy>=1.26; python_version < '3.12'\",\n"
+        "  \"numpy>=2; python_version >= '3.12'\",\n]\n"
+    )
+
+    cli.report_changes(old, old.replace(">=1.26", ">=1.26.4"))
+
+    out = capsys.readouterr().out
+    assert "Updated 1 of 1 dependency:" in out
+    assert "numpy  >=1.26, >=2 -> >=1.26.4, >=2" in out
+
+
+def test_report_changes_looks_past_a_direct_reference_of_the_same_package(capsys):
+    # the direct reference has no bound to compare -- but it hid the move of
+    # the registry entry next to it (reproduced against real uv)
+    old = (
+        '[project]\nname="d"\ndependencies=[\n'
+        "  \"iniconfig>=1.0; sys_platform != 'linux'\",\n"
+        "  \"iniconfig @ https://example.com/x.whl ; sys_platform == 'linux'\",\n]\n"
+    )
+
+    cli.report_changes(old, old.replace(">=1.0", ">=2.0.0"))
+
+    out = capsys.readouterr().out
+    assert "iniconfig  >=1.0 -> >=2.0.0" in out
+    assert "added" not in out
+
+
+def test_collect_bounds_counts_a_direct_reference_as_present_without_a_bound():
+    data = tomllib.loads(
+        '[project]\nname="d"\ndependencies=["priv @ https://example.com/x.whl; os_name == \'nt\'"]\n'
+    )
+    assert cli.collect_bounds(data) == {("dependencies", "priv"): ()}
 
 
 def test_run_echoes_a_shell_quotable_command(capsys):
@@ -1290,6 +1776,39 @@ def test_run_echoes_a_shell_quotable_command(capsys):
     echoed = capsys.readouterr().out.strip().removeprefix("$ ").strip()
     # unquoted, the ';' alone made this a different command when pasted
     assert shlex.split(echoed) == argv
+
+
+def test_run_echoes_single_quoted_markers_readably(capsys):
+    # regression test: shlex's escape for a ' made the echo of uv's own
+    # marker style read  == '"'"'linux'"'"''  -- and work in no Windows shell
+    argv = ["uv", "add", "--raw", "--", "priv @ https://example.com/x.whl ; sys_platform == 'linux'"]
+
+    cli.run(argv, Path("."), dry=True)
+
+    echoed = capsys.readouterr().out.strip().removeprefix("$ ").strip()
+    assert echoed.endswith("\"priv @ https://example.com/x.whl ; sys_platform == 'linux'\"")
+    assert shlex.split(echoed) == argv
+
+
+@pytest.mark.parametrize(
+    ("arg", "expected"),
+    [
+        ("plain", "plain"),
+        ("a b", "'a b'"),
+        ("x ; os_name == 'nt'", "\"x ; os_name == 'nt'\""),
+        ("x ; os_name != 'nt'", "\"x ; os_name != 'nt'\""),  # bash/zsh never expand '!='
+        # anything a double-quoted string would expand keeps shlex's form
+        ("it's $HOME", None),
+        ("it's `cmd`", None),
+        ('it\'s "quoted"', None),
+        ("it's a\\b", None),
+        ("it's !history", None),
+    ],
+)
+def test_shell_quote(arg, expected):
+    quoted = cli._shell_quote(arg)
+    assert quoted == (expected or shlex.quote(arg))
+    assert shlex.split(quoted) == [arg]
 
 
 def test_run_passes_quiet_through_to_uv(monkeypatch):
@@ -1318,8 +1837,8 @@ def test_run_leaves_non_uv_commands_alone(monkeypatch):
 
 def test_say_row_aligns_on_the_shared_width(capsys):
     width = len("group [integration]")
-    cli.say_row("dependencies", "a", width)
-    cli.say_row("group [integration]", "b", width)
+    cli.say_row("dependencies", ["a"], width)
+    cli.say_row("group [integration]", ["b"], width)
 
     first, second = capsys.readouterr().out.splitlines()
     assert first.index(":") == second.index(":")
@@ -1328,13 +1847,32 @@ def test_say_row_aligns_on_the_shared_width(capsys):
 def test_say_row_wraps_long_lists_with_a_hanging_indent(capsys, monkeypatch):
     monkeypatch.setattr(cli, "_wrap_width", lambda: 40)
 
-    cli.say_row("dependencies", ", ".join(f"package-{i}" for i in range(12)), len("dependencies"))
+    cli.say_row("dependencies", [f"package-{i}" for i in range(12)], len("dependencies"))
 
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) > 1
     assert all(len(line) <= 40 for line in lines)
     indent = lines[0].index(":") + 2
     assert all(line.startswith(" " * indent) for line in lines[1:])
+
+
+def test_say_row_never_breaks_inside_an_item(capsys, monkeypatch):
+    # regression test: 'numpy;' ended one line, 'python_version >= "3.12"'
+    # started the next -- no telling where one dependency ends
+    monkeypatch.setattr(cli, "_wrap_width", lambda: 60)
+    items = [
+        'httpx; sys_platform == "win32"',
+        'numpy; python_version >= "3.12"',
+        "rich",
+        'uvloop; os_name != "nt"',
+    ]
+
+    cli.say_row("dependencies", items, len("dependencies"))
+
+    # each line, minus label and indent, is a run of whole items
+    body = [line.split(" : ", 1)[-1].strip().rstrip(",") for line in capsys.readouterr().out.splitlines()]
+    assert len(body) > 1
+    assert [item for line in body for item in line.split(", ")] == items
 
 
 @pytest.mark.parametrize("answer", ["y", "yes", "Y", " YES "])
@@ -1371,13 +1909,23 @@ def test_positive_seconds_rejects_non_positive(value):
         cli.positive_seconds(value)
 
 
-def test_positive_seconds_rejects_non_numbers():
+@pytest.mark.parametrize("value", ["abc", "nan", "NaN"])
+def test_positive_seconds_rejects_non_numbers(value):
     with pytest.raises(cli.argparse.ArgumentTypeError, match="not a number"):
-        cli.positive_seconds("abc")
+        cli.positive_seconds(value)
 
 
-def test_positive_seconds_accepts_a_real_timeout():
-    assert cli.positive_seconds("12.5") == 12.5
+@pytest.mark.parametrize("value", ["inf", "1e10", "86401"])
+def test_positive_seconds_rejects_what_no_platform_can_wait_for(value):
+    # regression test: accepted, then the first uv call on Windows failed
+    # with 'cannot convert float infinity to integer' -- after the backup
+    with pytest.raises(cli.argparse.ArgumentTypeError, match="at most 86400"):
+        cli.positive_seconds(value)
+
+
+@pytest.mark.parametrize(("value", "expected"), [("12.5", 12.5), ("86400", 86400.0)])
+def test_positive_seconds_accepts_a_real_timeout(value, expected):
+    assert cli.positive_seconds(value) == expected
 
 
 def test_main_aligns_the_dependency_rows(tmp_path, monkeypatch, capsys):
@@ -1421,8 +1969,10 @@ def test_main_reassures_before_asking_not_after(tmp_path, monkeypatch, capsys):
         ('fastapi[standard]>=0.110; python_version<"3.13"', ("fastapi", ">=0.110")),
         ("pkg @ git+https://example.com/r.git", ("pkg", "@ git+https://example.com/r.git")),
         ("pkg[extra] @ https://example.com/x.whl", ("pkg", "@ https://example.com/x.whl")),
+        ("pkg @ https://example.com/x.whl; os_name == 'nt'", ("pkg", "@ https://example.com/x.whl")),
         ("torch==2.1.0+cu118", ("torch", "==2.1.0+cu118")),
         ("!!!", None),
+        ("foo bar @ https://example.com/x.whl", None),
     ],
 )
 def test_name_and_bound_fallback_matches_packaging(monkeypatch, spec, expected):
@@ -1478,7 +2028,7 @@ def test_report_changes_does_not_call_a_package_removed_while_it_remains(capsys)
 
 def test_say_row_keeps_the_prefix_when_the_value_is_empty(capsys):
     # textwrap.fill('') returns '' -- the row used to print as a blank line
-    cli.say_row("dependencies", "", len("dependencies"))
+    cli.say_row("dependencies", [], len("dependencies"))
 
     assert capsys.readouterr().out.strip() == "dependencies :"
 

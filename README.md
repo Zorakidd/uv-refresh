@@ -7,7 +7,8 @@ resolved instead of dragging along old version pins.
 
 1. Read `pyproject.toml`, collect the dependencies without their version
    specifiers (extras and environment markers are kept; `include-group`
-   entries in `dependency-groups` are resolved, not dropped)
+   entries in `dependency-groups` are expanded for uv, and stay as they are
+   in the file)
 2. Back up `pyproject.toml` and `uv.lock` into `.uv-refresh-backup/<timestamp>/`
 3. Run `uv init --bare` + `uv add <packages>` in a temp directory next to
    the project, with the project's `[tool.uv]` settings (indexes, sources,
@@ -21,7 +22,8 @@ resolved instead of dragging along old version pins.
 
 If any step fails -- including Ctrl+C -- the real `pyproject.toml` was never
 touched, since the whole build happened in the temp directory. The backup
-is kept around as an extra reference regardless.
+is kept around as an extra reference regardless. Should something go wrong
+right after the swap, the tool says the file was already replaced instead.
 
 ## Installation
 
@@ -52,7 +54,7 @@ Or straight from the repo, e.g. to try an unreleased version:
 | `-y`, `--yes` | run without asking for confirmation |
 | `-v`, `--verbose` | print the full new `pyproject.toml` at the end |
 | `-q`, `--quiet` | only print warnings/errors -- also quiets `uv` itself |
-| `--timeout SECONDS` | timeout per `uv` call, default 300s |
+| `--timeout SECONDS` | timeout per `uv` call, default 300s, at most one day |
 | `--raw` | add packages with no version bound at all |
 | `--bounds {lower,major,minor,exact}` | kind of version bound `uv add` sets |
 | `--keep-lock` | keep `uv.lock` (uv will then prefer the old versions!) |
@@ -75,8 +77,11 @@ the backup by hand:
 
     Done.
 
-If nothing moved, it says so instead. `--verbose` additionally prints the
-whole new `pyproject.toml`; `--quiet` prints neither.
+A package listed more than once in a section, e.g. once per marker, gets
+one row with all of its bounds (`numpy  >=1.26, >=2 -> >=1.26.4, >=2.3`). If
+nothing moved, it says so instead -- also when `--no-groups` removed
+packages at the same time. `--verbose` additionally prints the whole new
+`pyproject.toml`; `--quiet` prints neither.
 
 ## Note
 
@@ -89,14 +94,24 @@ to resolve versions, then takes just the freshly resolved dependency lists
 from it and writes those back into a copy of the original file. Within those
 lists, each entry only gets its new bound in place: comments (above an entry,
 after it, or between two groups) and the order of the entries stay as they
-were. Direct references (`pkg @ git+https://...`) have no bound to refresh
-and are kept exactly as written. The file keeps its line endings and a
-UTF-8 BOM, if it had one.
+were, and so does your spelling of the package name, extras and markers --
+uv writes its own (`Typing_Extensions` as `typing-extensions`,
+`python_version < '3.12'` as `python_full_version < '3.12'`), but only the
+bound is taken from it. A package listed several times with different
+markers keeps each bound with the marker it belongs to. `include-group`
+entries stay as they are. Only `--drop-extras`/`--drop-markers` change an
+entry beyond its bound, since that's what they're for.
+
+Direct references (`pkg @ git+https://...`) have no bound to refresh and are
+kept exactly as written -- also as `pkg @ https://...; marker` without a
+space before the `;`, which uv accepts although PEP 508 doesn't. The file
+keeps its line endings and a UTF-8 BOM, if it had one.
 
 Direct references may carry credentials (`https://user:token@...`). The
 output masks them as `https://***@...`, and in a git repository (including
 worktrees, submodules and projects in a subdirectory) the backup and temp
-directories are added to `.gitignore`.
+directories are added to `.gitignore` -- unless git already ignores them,
+e.g. through the repository's root `.gitignore`.
 
 One exception: with `--no-groups`, any existing
 `optional-dependencies`/`dependency-groups` are intentionally removed (the

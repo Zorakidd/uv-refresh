@@ -46,7 +46,9 @@ from __future__ import annotations
 import argparse
 import codecs
 import contextlib
+import functools
 import json
+import math
 import os
 import platform
 import re
@@ -56,23 +58,26 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import tomllib
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NoReturn
+from typing import NamedTuple, NoReturn
 
 import tomlkit
-from tomlkit.items import Array
+from tomlkit.items import Array, StringType
 
 from . import __version__
 
 try:  # bevorzugt der offizielle PEP-508-Parser
+    from packaging.markers import InvalidMarker, Marker
     from packaging.requirements import InvalidRequirement, Requirement
 except ModuleNotFoundError:  # Fallback, damit das Skript auch nackt laeuft
     Requirement = None
-    InvalidRequirement = ValueError  # ty: ignore[invalid-assignment]
+    Marker = None  # ty: ignore[invalid-assignment]
+    InvalidRequirement = InvalidMarker = ValueError  # ty: ignore[invalid-assignment]
 
 try:  # --full's requires-python handling; without packaging, plan_full() skips it
     from packaging.specifiers import InvalidSpecifier, SpecifierSet
@@ -87,9 +92,13 @@ _USERINFO_RE = re.compile(r"(?<=://)[^/\s@]+@")
 
 C_OK, C_WARN, C_ERR, C_DIM, C_OFF = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
 
-# seconds, for the quick local helper commands ('uv python list', icacls) --
+# seconds, for the quick local helper commands ('uv python list', icacls, git check-ignore) --
 # --timeout only covers the uv calls that resolve/lock
 _HELPER_TIMEOUT = 60
+# --timeout's upper limit, see positive_seconds()
+_MAX_TIMEOUT = 86400
+# tries at removing the temp build, 0.1s apart -- see _temp_build()
+_CLEANUP_ATTEMPTS = 20
 
 TEMP_NOTE = (
     "Building in a temp directory; your real pyproject.toml/uv.lock stay untouched until the final step."
@@ -132,31 +141,35 @@ def _wrap_width() -> int:
     return max(shutil.get_terminal_size(fallback=(100, 24)).columns - 1, 40)
 
 
-def say_row(label: str, value: str, width: int, color: str = "") -> None:
-    """One 'label : value' line, padded to a width shared by all rows and
+def say_row(label: str, items: list[str], width: int, color: str = "") -> None:
+    """One 'label : a, b, c' line, padded to a width shared by all rows and
     wrapped with a hanging indent.
 
     A real project's dependency list is one long comma-joined string --
     unwrapped, 30 dependencies are ~700 characters of ragged reflow directly
     above the confirmation prompt, which is exactly where it has to be read.
+
+    Lines only break between items: a marker has spaces of its own, and
+    'numpy;' at the end of one line with 'python_version >= "3.12"' on the
+    next no longer showed where one dependency ends and the next begins.
     """
     prefix = f"  {label.ljust(width)} : "
-    if not value:
+    if not items:
         # textwrap.fill('') has no words to lay out and returns '' -- the
         # prefix would vanish and the row print as a blank line
         say(prefix.rstrip(), color)
         return
-    say(
-        textwrap.fill(
-            value,
-            width=_wrap_width(),
-            initial_indent=prefix,
-            subsequent_indent=" " * len(prefix),
-            break_long_words=False,
-            break_on_hyphens=False,
-        ),
-        color,
+    # textwrap only breaks at ASCII whitespace, never at a no-break space
+    value = ", ".join(item.replace(" ", "\xa0") for item in items)
+    wrapped = textwrap.fill(
+        value,
+        width=_wrap_width(),
+        initial_indent=prefix,
+        subsequent_indent=" " * len(prefix),
+        break_long_words=False,
+        break_on_hyphens=False,
     )
+    say(wrapped.replace("\xa0", " "), color)
 
 
 def confirm(prompt: str) -> bool:
@@ -233,7 +246,10 @@ def specs_from(entries: list, keep_extras: bool, keep_markers: bool) -> list[str
         if not spec or spec.lower() in seen:
             continue
         seen.add(spec.lower())
-        if "@" in spec:
+        # the same test build_and_swap() and _update_array() use -- a bare
+        # '"@" in spec' also called a broken entry like '--index-url=...@x'
+        # a direct reference
+        if _is_direct_reference(spec):
             say(f"  {spec}: direct reference, left unchanged", C_WARN)
         out.append(spec)
     return out
@@ -284,10 +300,14 @@ def restrict_to_owner(path: Path) -> None:
         return
     try:
         grant = f"{os.environ.get('USERNAME', '')}:(OI)(CI)F"
+        # captured as bytes, never decoded -- only the exit code matters, and
+        # icacls answers in the OEM code page: text=True decoded it as ANSI,
+        # a 'ü' in the path (cp850 0x81) has no ANSI character, and the reader
+        # thread printed a UnicodeDecodeError traceback on every run from a
+        # path like C:\Users\Jürgen\... (reproduced)
         result = subprocess.run(
             ["icacls", str(path), "/inheritance:r", "/grant:r", grant],
             capture_output=True,
-            text=True,
             check=False,
             timeout=_HELPER_TIMEOUT,
         )
@@ -334,12 +354,23 @@ def ensure_backup_ignored(root: Path) -> None:
     Gesucht wird '.git' in root UND allen Elternverzeichnissen, als Datei oder
     Ordner: nur 'root/.git' als Ordner uebersah Worktrees und Submodule (dort
     ist .git eine Datei) und jedes Projekt in einem Unterordner eines Repos.
+
+    Was git schon ignoriert (z. B. per .gitignore an der Repo-Wurzel), wird
+    nicht noch einmal eingetragen: sonst bekam jedes Unterprojekt eines
+    Monorepos eine eigene, ueberfluessige .gitignore samt Warnung.
     """
     if not any((p / ".git").exists() for p in (root, *root.parents)):
         return
     gitignore = root / ".gitignore"
     text = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
-    missing = [e for e in (".uv-refresh-backup/", ".uv-refresh-tmp-*/") if e not in text.splitlines()]
+    # a file inside each directory: git can only match a directory pattern
+    # like '.uv-refresh-backup/' against a path it knows to be one
+    probes = {
+        ".uv-refresh-backup/": ".uv-refresh-backup/probe",
+        ".uv-refresh-tmp-*/": ".uv-refresh-tmp-probe/probe",
+    }
+    lines = text.splitlines()
+    missing = [e for e, probe in probes.items() if e not in lines and not _git_ignores(root, probe)]
     if not missing:
         return
     with gitignore.open("a", encoding="utf-8") as f:
@@ -347,6 +378,23 @@ def ensure_backup_ignored(root: Path) -> None:
             f.write("\n")
         f.writelines(f"{e}\n" for e in missing)
     say(f"  added {', '.join(missing)} to .gitignore (backup/temp build may contain credentials)", C_WARN)
+
+
+def _git_ignores(root: Path, path: str) -> bool:
+    """Whether git already ignores 'path' (relative to root). False whenever
+    git can't tell -- not installed, not a real repo, ... -- so the entry is
+    added after all: the safe side."""
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", "--", path],
+            cwd=root,
+            capture_output=True,
+            check=False,
+            timeout=_HELPER_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def build_init_cmd(name: str | None, requires_python: str | None, description: str | None) -> list[str]:
@@ -366,6 +414,21 @@ def build_init_cmd(name: str | None, requires_python: str | None, description: s
     return cmd
 
 
+def _shell_quote(arg: str) -> str:
+    """shlex.quote(), except that an argument with single quotes in it -- a
+    marker as uv writes it, "pkg ; sys_platform == 'linux'" -- goes into
+    double quotes when nothing in it is special there.
+
+    shlex escapes each single quote as '"'"', which is unreadable and only
+    works in a POSIX shell; the double-quoted form reads as what it is and
+    pastes the same into bash, zsh and PowerShell. '!=' is fine: bash and zsh
+    never expand a '!' followed by '='.
+    """
+    if "'" in arg and not re.search(r'[$`"\\]|!(?!=)', arg):
+        return f'"{arg}"'
+    return shlex.quote(arg)
+
+
 def run(cmd: list[str], cwd: Path, dry: bool, timeout: float | None = None) -> None:
     # --quiet has to reach uv itself: run() never captures the child's output,
     # so without this uv keeps streaming its progress and -q only strips OUR
@@ -374,17 +437,18 @@ def run(cmd: list[str], cwd: Path, dry: bool, timeout: float | None = None) -> N
     # subcommand, and still reports errors through it.
     if _quiet and cmd[:1] == ["uv"]:
         cmd = [cmd[0], "--quiet", *cmd[1:]]
-    # shlex, not ' '.join: an unquoted marker ('httpx; sys_platform == "win32"')
+    # quoted, not ' '.join: an unquoted marker ('httpx; sys_platform == "win32"')
     # printed as a copy-pasteable '$ ' line is a DIFFERENT command -- the ';'
     # splits it. The argv we pass was always right; only the echo lied.
-    shown = shlex.join(cmd)
+    shown = " ".join(map(_shell_quote, cmd))
     say(f"  $ {shown}", C_DIM)
     if dry:
         return
     try:
         result = subprocess.run(cmd, cwd=cwd, check=False, timeout=timeout)
     except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"Command ran longer than {timeout:.0f}s and was aborted: {shown}") from e
+        # :g, not :.0f -- '--timeout 0.5' read 'ran longer than 0s'
+        raise RuntimeError(f"Command ran longer than {timeout:g}s and was aborted: {shown}") from e
     if result.returncode != 0:
         raise RuntimeError(f"Command failed: {shown}")
 
@@ -401,10 +465,13 @@ def latest_installed_python() -> str | None:
     never become the minimum Python of a published package.
     """
     try:
+        # uv writes UTF-8 -- text=True decoded it with the locale's code page
+        # (cp1252 on Windows): the interpreter paths in there came out garbled,
+        # and one with e.g. an 'Á' (UTF-8 C3 81, no 0x81 in cp1252) failed
         result = subprocess.run(
             ["uv", "python", "list", "--only-installed", "--output-format", "json"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             check=False,
             timeout=_HELPER_TIMEOUT,
         )
@@ -576,73 +643,239 @@ def _toml_group_table(groups: dict[str, list[str]]):
     return table
 
 
-def _requirement_key(spec: str) -> str:
-    """Same package, extras and markers -- however either side formatted them."""
-    return (strip_version(spec) or spec).lower()
-
-
-def _package_key(spec: str) -> str:
-    parsed = _name_and_bound(spec)
-    return parsed[0] if parsed else spec.lower()
-
-
 def _is_direct_reference(spec: str) -> bool:
     """'pkg @ git+https://...' and the like -- see strip_version()."""
     parsed = _name_and_bound(spec)
     return parsed is not None and parsed[1].startswith("@")
 
 
-def _update_array(arr, new: list[str]) -> None:
+@functools.cache
+def _marker_environments() -> list[dict[str, str]]:
+    """The environments _marker_signature() evaluates a marker in: every
+    Python from 2.7 to 3.20 (a .0 and a late patch release each) on the
+    common OS/architecture/implementation combinations."""
+    platforms = [
+        ("linux", "Linux", "posix", "x86_64"),
+        ("linux", "Linux", "posix", "aarch64"),
+        ("win32", "Windows", "nt", "AMD64"),
+        ("win32", "Windows", "nt", "ARM64"),
+        ("darwin", "Darwin", "posix", "arm64"),
+        ("darwin", "Darwin", "posix", "x86_64"),
+    ]
+    pythons = ["2.7.18", *(f"3.{minor}.{patch}" for minor in range(21) for patch in (0, 99))]
+    return [
+        {
+            "python_version": ".".join(full.split(".")[:2]),
+            "python_full_version": full,
+            "implementation_version": full,
+            "sys_platform": sys_platform,
+            "platform_system": system,
+            "os_name": os_name,
+            "platform_machine": machine,
+            "implementation_name": impl,
+            "platform_python_implementation": impl_name,
+        }
+        for full in pythons
+        for sys_platform, system, os_name, machine in platforms
+        for impl, impl_name in (("cpython", "CPython"), ("pypy", "PyPy"))
+    ]
+
+
+@functools.cache
+def _marker_signature(marker: str | None) -> tuple[bool, ...] | None:
+    """Whether 'marker' holds in each of _marker_environments() -- equal
+    signatures mean equal markers for any practical purpose. None if it
+    can't be evaluated (or packaging is missing).
+
+    uv rewrites every marker it writes -- "python_version < '3.12'" comes
+    back as "python_full_version < '3.12'", "> '3.10'" as ">= '3.11'" (all
+    reproduced against real uv) -- so the text never matches the original's.
+    What the marker means does.
+    """
+    if Marker is None:
+        return None
+    envs = _marker_environments()
+    if marker is None:
+        return (True,) * len(envs)
+    try:
+        parsed = Marker(marker)
+        return tuple(parsed.evaluate(env) for env in envs)
+    except ValueError:  # InvalidMarker, UndefinedComparison, ...
+        return None
+
+
+def _exact_key(spec: str):
+    """Same package, extras, marker and URL -- however either side spaced or quoted them."""
+    entry = _parse_entry(spec)
+    if entry is None:
+        return None
+    url = entry.bound if entry.bound.startswith("@") else None
+    return entry.name, entry.extras, url, entry.marker
+
+
+def _marker_key(spec: str):
+    """Same package and extras, and a marker that holds in the same environments."""
+    entry = _parse_entry(spec)
+    if entry is None or (signature := _marker_signature(entry.marker)) is None:
+        return None
+    return entry.name, entry.extras, entry.bound.startswith("@"), signature
+
+
+def _package_key(spec: str):
+    """Same package -- and both or neither a direct reference: a direct
+    reference's slot keeps its original text, so pairing it with a registry
+    entry's fresh spec (or the other way around) lost that registry entry
+    for good -- reproduced against real uv, see _update_array()."""
+    entry = _parse_entry(spec)
+    return None if entry is None else (entry.name, entry.bound.startswith("@"))
+
+
+def _direct_name(spec: str) -> str | None:
+    entry = _parse_entry(spec)
+    return entry.name if entry is not None and entry.bound.startswith("@") else None
+
+
+def _plain_name(spec: str) -> str | None:
+    entry = _parse_entry(spec)
+    return entry.name if entry is not None and not entry.bound.startswith("@") else None
+
+
+def _split_bound(spec: str) -> tuple[str, str, str] | None:
+    """(head, bound, tail) with head + bound + tail == spec: the version bound
+    exactly as written, and around it the name, extras and marker. None for a
+    direct reference or anything that doesn't start like a requirement."""
+    m = _SPEC_RE.match(spec)
+    if not m or _is_direct_reference(spec):
+        return None
+    cut = spec.find(";", m.end())
+    if cut < 0:
+        cut = len(spec)
+    bound = spec[m.end() : cut].strip()
+    # without a bound, the new one goes right after the name/extras -- before
+    # any space in front of the marker ('numpy ; ...' -> 'numpy>=2.3 ; ...')
+    start = spec.index(bound, m.end()) if bound else len(spec[: m.end()].rstrip())
+    return spec[:start], bound, spec[start + len(bound) :]
+
+
+def _with_bound(orig: str, fresh: str) -> str:
+    """orig with fresh's version bound -- only the bound changes; the package
+    name, extras and marker stay exactly as they were written.
+
+    uv's own text would also bring its spelling of all of those, e.g.
+    'Typing_Extensions' as 'typing-extensions' and a rewritten marker (see
+    _marker_signature) -- diff noise for what didn't change. Only used for
+    entries matched as the same requirement; anything the split can't
+    handle cleanly takes uv's text instead of risking a broken entry.
+    """
+    old, new = _split_bound(orig), _split_bound(fresh)
+    if old is None or new is None:
+        return fresh
+    if _name_and_bound(orig) == _name_and_bound(fresh):
+        return orig  # same bound, however it was spaced
+    head, _, tail = old
+    merged = head + new[1] + tail
+    return merged if _name_and_bound(merged) == _name_and_bound(fresh) else fresh
+
+
+def _string_like(item, text: str):
+    """text as a TOML string in the quoting style of 'item' -- a single-quoted
+    'literal' entry stays one, instead of coming back "with \\"escapes\\"".
+    """
+    if getattr(item, "type", None) == StringType.SLL and "'" not in text:
+        return tomlkit.string(text, literal=True)
+    return text
+
+
+def _update_array(arr, new: list[str], covered: frozenset[str] = frozenset()) -> None:
     """Rewrites the tomlkit array 'arr' in place so it holds exactly 'new'.
 
     Swapping in a freshly built array dropped every comment inside the old
     one -- a note above a dependency saying why it's there was gone after
     the first refresh. Instead each fresh spec takes over the slot of the
-    entry it replaces, so comments above it, a trailing comment on its line
-    and the original order all stay. Matched by requirement first, then by
-    package name alone: --drop-extras/--drop-markers change the requirement,
-    and uv may write a marker differently than the original did.
+    entry it replaces, and only that entry's version bound changes (see
+    _with_bound), so comments above it, a trailing comment on its line and
+    the original order all stay.
+
+    Matched in passes, strictest first: the same requirement as written; the
+    same requirement with a marker that means the same thing (uv rewrites
+    every marker, see _marker_signature -- matching the rest by package name
+    alone swapped two entries of one package, and their comments with them);
+    then the package alone, for what --drop-extras/--drop-markers changed on
+    purpose -- those take uv's text. None of these ever pairs a direct
+    reference with a registry entry, see _package_key.
 
     A direct reference keeps its original text: it has no bound to refresh,
     and whatever uv wrote for it (a respaced URL, or a bare 'pkg' whose URL
     went to the temp build's [tool.uv.sources], which is never merged back)
     must not replace it -- a bare 'pkg' silently resolved from PyPI instead.
+    That's what the last pass is for: a bare 'pkg' still left over belongs to
+    a direct reference of that package that's still left over, if any.
 
-    Old entries without a counterpart (e.g. an include-group, which
-    resolve_groups() expanded) are removed, specs without one appended.
+    Non-string entries -- an {include-group = ...} -- stay where they are.
+    resolve_groups() expanded them for uv, so the fresh specs of the
+    packages they bring in ('covered') are dropped instead of copied in.
+    Old entries without a counterpart are removed, specs without one appended.
     """
     old = list(arr)
-    taken: dict[int, str] = {}  # old index -> fresh spec
+    taken: dict[int, tuple[str, bool]] = {}  # old index -> (fresh spec, same requirement?)
     pending = list(new)
-    for key in (_requirement_key, _package_key):
-        free: dict[str, list[int]] = {}
+    passes = [  # (key for the old entries, key for the fresh specs, same requirement?)
+        (_exact_key, _exact_key, True),
+        (_marker_key, _marker_key, True),
+        (_package_key, _package_key, False),
+        (_direct_name, _plain_name, False),
+    ]
+    for old_key, new_key, same in passes:
+        free: dict = {}
         for i, entry in enumerate(old):
-            if isinstance(entry, str) and i not in taken:
-                free.setdefault(key(entry), []).append(i)
+            if isinstance(entry, str) and i not in taken and (k := old_key(entry)) is not None:
+                free.setdefault(k, []).append(i)
         rest = []
         for spec in pending:
-            if slots := free.get(key(spec)):
-                taken[slots.pop(0)] = spec
+            k = new_key(spec)
+            if k is not None and (slots := free.get(k)):
+                taken[slots.pop(0)] = (spec, same)
             else:
                 rest.append(spec)
         pending = rest
 
-    for i, spec in taken.items():
-        # an unchanged entry keeps its exact original text
-        if arr[i] != spec and not _is_direct_reference(arr[i]):
-            arr[i] = spec
+    for i, (spec, same) in taken.items():
+        if _is_direct_reference(arr[i]):
+            continue
+        text = _with_bound(arr[i], spec) if same else spec
+        if text != arr[i]:
+            arr[i] = _string_like(arr[i], text)
     for i in reversed(range(len(old))):
-        if i not in taken:
+        if i not in taken and isinstance(old[i], str):
             del arr[i]
     for spec in pending:
-        arr.append(spec)
+        entry = _parse_entry(spec)
+        if entry is None or entry.name not in covered:
+            arr.append(spec)
 
 
-def _set_array(parent, key: str, new: list[str]) -> None:
+def _set_array(parent, key: str, new: list[str], covered: frozenset[str] = frozenset()) -> None:
     if isinstance(parent.get(key), Array):
-        _update_array(parent[key], new)
+        _update_array(parent[key], new, covered)
     else:
         parent[key] = _toml_array(new)
+
+
+def _included_names(groups, grp: str, seen: frozenset[str] = frozenset()) -> frozenset[str]:
+    """Every package that grp's include-group entries (PEP 735) bring in,
+    also through include-groups of their own."""
+    names: set[str] = set()
+    for entry in groups.get(grp) or []:
+        if not (isinstance(entry, dict) and "include-group" in entry):
+            continue
+        included = str(entry["include-group"])
+        if included in seen:  # a cycle -- resolve_groups() refuses those anyway
+            continue
+        for spec in groups.get(included) or []:
+            if isinstance(spec, str) and (parsed := _parse_entry(spec)):
+                names.add(parsed.name)
+        names |= _included_names(groups, included, seen | {grp, included})
+    return frozenset(names)
 
 
 def _set_group_table(parent, key: str, groups: dict[str, list[str]]) -> None:
@@ -656,10 +889,13 @@ def _set_group_table(parent, key: str, groups: dict[str, list[str]]) -> None:
     if not isinstance(table, dict):
         parent[key] = _toml_group_table(groups)
         return
+    # before any group below changes: an include-group names what it brings
+    # in through the ORIGINAL entries of the group it includes
+    covered = {grp: _included_names(table, grp) for grp in table}
     for grp in [g for g in table if g not in groups]:
         del table[grp]
     for grp, specs in groups.items():
-        _set_array(table, grp, specs)
+        _set_array(table, grp, specs, covered.get(grp, frozenset()))
 
 
 def merge_dependencies(
@@ -791,55 +1027,113 @@ def _canonical_name(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def _name_and_bound(spec: str) -> tuple[str, str] | None:
-    """Canonical package name and the version bound of a PEP 508 spec -- '' when
-    it has none -- or None if the entry can't be parsed at all.
+class _Entry(NamedTuple):
+    """One dependency entry, taken apart -- see _parse_entry()."""
 
-    Unlike strip_version(), this keeps the bound and drops everything else:
-    the two halves of the same string, used for opposite purposes.
+    name: str  # canonical, see _canonical_name()
+    extras: frozenset[str]
+    bound: str  # normalized version bound, '' if none -- '@ <url>' for a direct reference
+    marker: str | None  # normalized, see _normalize_marker()
+
+
+def _normalize_marker(text: str) -> str | None:
+    """'python_version<"3.12"' and "python_version < '3.12'" alike become
+    'python_version < "3.12"' -- where packaging can parse the marker."""
+    text = text.strip()
+    if not text:
+        return None
+    if Marker is not None:
+        with contextlib.suppress(InvalidMarker):
+            return str(Marker(text))
+    return text
+
+
+def _parse_entry(spec: str) -> _Entry | None:
+    """Canonical name, extras, version bound and marker of a PEP 508 entry,
+    or None if it can't be parsed at all.
+
+    packaging first; where it refuses, the same tolerant parse as
+    strip_version()'s fallback. uv accepts more than packaging does, above
+    all 'pkg @ https://...; marker' -- PEP 508 wants a space before a ';'
+    that follows a URL. Giving up there (None) made that entry look like no
+    direct reference at all: 'uv add' ran without --raw, the URL went to the
+    temp build's [tool.uv.sources], and a bare 'pkg' resolved from PyPI took
+    its place (reproduced against real uv).
     """
     if Requirement is not None:
         try:
             req = Requirement(spec)
         except InvalidRequirement:
-            return None
-        if req.url:  # 'paket @ git+https://...' carries no comparable bound
-            return _canonical_name(req.name), f"@ {req.url}"
-        return _canonical_name(req.name), str(req.specifier)
+            pass  # see above
+        else:
+            return _Entry(
+                _canonical_name(req.name),
+                frozenset(map(_canonical_name, req.extras)),
+                f"@ {req.url}" if req.url else str(req.specifier),
+                str(req.marker) if req.marker else None,
+            )
 
-    # Fallback, falls packaging fehlt -- siehe strip_version()
-    head = spec.partition(";")[0]
+    head, sep, marker = spec.partition(";")
     name_part, at, url = head.partition("@")
     m = _SPEC_RE.match(name_part if at else head)
-    if not m:
+    # 'foo bar @ ...' is no direct reference: nothing but the name and extras before the '@'
+    if not m or (at and name_part[m.end() :].strip()):
         return None
-    if at:
-        return _canonical_name(m.group("name")), f"@ {url.strip()}"
-    return _canonical_name(m.group("name")), head[m.end() :].strip()
+    extras = (m.group("extras") or "[]")[1:-1].split(",")
+    return _Entry(
+        _canonical_name(m.group("name")),
+        frozenset(_canonical_name(e.strip()) for e in extras if e.strip()),
+        f"@ {url.strip()}" if at else head[m.end() :].strip(),
+        _normalize_marker(marker) if sep else None,
+    )
 
 
-def collect_bounds(data: dict) -> dict[tuple[str, str], str]:
-    """Every dependency's version bound, keyed by (section, canonical name).
+def _name_and_bound(spec: str) -> tuple[str, str] | None:
+    """Canonical package name and the version bound of a PEP 508 spec -- '' when
+    it has none, '@ <url>' for a direct reference -- or None if the entry
+    can't be parsed at all.
+
+    Unlike strip_version(), this keeps the bound and drops everything else:
+    the two halves of the same string, used for opposite purposes.
+    """
+    entry = _parse_entry(spec)
+    return None if entry is None else (entry.name, entry.bound)
+
+
+def collect_bounds(data: dict) -> dict[tuple[str, str], tuple[str, ...]]:
+    """Every dependency's version bounds, keyed by (section, canonical name).
 
     Keyed by section and not by name alone: the same package can sit in
     dependencies AND in a group with a different bound, and collapsing both
     onto one key made a move in whichever came second read as 'nothing
-    changed' -- a wrong report, not just an incomplete one.
+    changed' -- a wrong report, not just an incomplete one. For the same
+    reason each key holds ALL distinct bounds of that package in that
+    section: one package listed twice with different markers used to keep
+    only the last entry's bound, and a move in the first went unreported
+    (reproduced against real uv).
+
+    A direct reference counts as present but adds no bound -- it has none to
+    compare, and its text is never changed (see _update_array).
     """
     project = data.get("project", {})
     sections: list[tuple[str, list]] = [("dependencies", project.get("dependencies") or [])]
-    sections += [
-        (f"optional [{g}]", e) for g, e in (project.get("optional-dependencies") or {}).items()
-    ]
+    sections += [(f"optional [{g}]", e) for g, e in (project.get("optional-dependencies") or {}).items()]
     sections += [(f"group [{g}]", e) for g, e in (data.get("dependency-groups") or {}).items()]
 
-    out: dict[tuple[str, str], str] = {}
+    out: dict[tuple[str, str], set[str]] = {}
     for section, entries in sections:
         for entry in entries:
-            if isinstance(entry, str) and (parsed := _name_and_bound(entry)):
-                name, bound = parsed
-                out[(section, name)] = bound
-    return out
+            if isinstance(entry, str) and (parsed := _parse_entry(entry)):
+                bounds = out.setdefault((section, parsed.name), set())
+                if not parsed.bound.startswith("@"):
+                    bounds.add(parsed.bound)
+    return {key: tuple(sorted(bounds)) for key, bounds in out.items()}
+
+
+def _bounds_label(bounds: tuple[str, ...]) -> str:
+    """'>=1.0' -- or '(none), >=1.0' for a package listed twice, once without
+    a bound; '(direct)' when all it has is a direct reference."""
+    return ", ".join(b or "(none)" for b in bounds) or "(direct)"
 
 
 def _deps(n: int) -> str:
@@ -864,15 +1158,14 @@ def report_changes(original_text: str, new_text: str) -> None:
     except tomllib.TOMLDecodeError:  # nur der Report -- der Swap steht schon
         return
 
-    unset = "(none)"
     # one row per distinct (name, was, now): the same package moving the same
     # way in two sections moved once. Only when the SAME package moved
     # DIFFERENTLY per section do two rows survive -- and those get named.
     rows: dict[tuple[str, str, str], list[str]] = {}
-    for (section, name), bound in new.items():
+    for (section, name), bounds in new.items():
         was = old.get((section, name))
-        if was is not None and was != bound:
-            rows.setdefault((name, was or unset, bound or unset), []).append(section)
+        if was is not None and was != bounds:
+            rows.setdefault((name, _bounds_label(was), _bounds_label(bounds)), []).append(section)
 
     per_name = Counter(name for name, _, _ in rows)
     changed = sorted(
@@ -896,10 +1189,12 @@ def report_changes(original_text: str, new_text: str) -> None:
             say(f"  {name.ljust(name_w)}  {was.rjust(was_w)} -> {now}")
         if unchanged:
             say(f"  ({unchanged} unchanged)", C_DIM)
-    elif unchanged and not added and not removed:
+    elif unchanged:
         # 'unchanged' guards a project with no dependencies at all, which
         # main() refuses long before this -- but 'all 0 dependencies' would
-        # be a silly thing to ever print
+        # be a silly thing to ever print. Said even next to added/removed
+        # packages below: a --no-groups run that only removed a group
+        # otherwise said nothing at all about the bounds it came for.
         say(f"\nNo bounds changed -- {_deps(unchanged)} already current.", C_OK)
 
     extra = [("added", added), ("removed", removed)]
@@ -908,7 +1203,7 @@ def report_changes(original_text: str, new_text: str) -> None:
         say("")
     for label, names in extra:
         if names:
-            say_row(label, ", ".join(names), width)
+            say_row(label, names, width)
 
 
 def no_groups_blocker(tool_uv: dict) -> str | None:
@@ -1040,6 +1335,32 @@ def load_project_specs(pyproject: Path, args: argparse.Namespace) -> tuple[str, 
     )
 
 
+@contextlib.contextmanager
+def _temp_build(root: Path):
+    """The temp build directory: created next to the project, removed again
+    however the build ends.
+
+    Removing it must never fail the run -- after the swap that read as a
+    failed refresh, and before it, it replaced the error that actually
+    happened: on Windows, a --timeout ended in '[WinError 32] ... used by
+    another process' instead of the timeout message (reproduced), since the
+    uv it had just killed still held the directory. That hold only lasts a
+    moment, so removal is retried briefly -- and whatever still can't be
+    removed is reported, not silently left behind.
+    """
+    path = Path(tempfile.mkdtemp(dir=root, prefix=".uv-refresh-tmp-"))
+    try:
+        yield path
+    finally:
+        for _ in range(_CLEANUP_ATTEMPTS):
+            shutil.rmtree(path, ignore_errors=True)
+            if not path.exists():
+                break
+            time.sleep(0.1)
+        else:
+            say(f"  could not remove the temp build {path} -- safe to delete by hand", C_WARN)
+
+
 def build_and_swap(
     root: Path,
     pyproject: Path,
@@ -1050,14 +1371,19 @@ def build_and_swap(
     args: argparse.Namespace,
     new_requires_python: str | None = None,
     pin_python: str | None = None,
-) -> None:
+) -> str | None:
     """Runs steps 2-6: backup, 'uv init' + 'uv add' in a temp directory, merge
     the freshly resolved dependencies into a copy of the ORIGINAL
-    pyproject.toml, then atomically swap it into place.
+    pyproject.toml, then atomically swap it into place. Returns the new
+    pyproject.toml text for main()'s change report -- None on --dry-run,
+    which has nothing to report.
 
-    pyproject.toml/uv.lock are only ever touched by the final atomic swap, so
-    if this raises (including on KeyboardInterrupt), they are guaranteed
-    unchanged -- 'backup' is kept regardless, as an extra safety net.
+    pyproject.toml/uv.lock are only ever touched by the final atomic swap, and
+    it is the last thing in here that can fail: if this raises (including on
+    KeyboardInterrupt), they are unchanged -- 'backup' is kept regardless, as
+    an extra safety net. The report used to run in here too, after the swap:
+    Ctrl+C or a broken pipe while it printed then read as 'pyproject.toml
+    unchanged' for a file that had long been replaced.
 
     new_requires_python is only set when --full decided requires-python has
     to go up (see plan_full()); it's then written as
@@ -1067,11 +1393,7 @@ def build_and_swap(
     pin will use; the temp build already resolves against it, see
     pin_build_interpreter().
     """
-    build_ctx = (
-        tempfile.TemporaryDirectory(dir=root, prefix=".uv-refresh-tmp-")
-        if not args.dry_run
-        else contextlib.nullcontext(root)
-    )
+    build_ctx = _temp_build(root) if not args.dry_run else contextlib.nullcontext(root)
 
     if not args.dry_run:
         ensure_backup_ignored(root)
@@ -1139,39 +1461,49 @@ def build_and_swap(
         for grp, deps in specs.groups.items():
             add_all(["--group", grp], deps)
 
-        # ---- 5. Dependencies in die ORIGINALE pyproject.toml einmergen ----
-        if not args.dry_run:
-            built = tomllib.loads((build_dir / "pyproject.toml").read_text(encoding="utf-8"))
-            built_project = built.get("project", {})
-            merged = merge_dependencies(
-                original_text,
-                built_project.get("dependencies", []),
-                built_project.get("optional-dependencies", {}),
-                built.get("dependency-groups", {}),
-                new_requires_python,
-            )
-            (build_dir / "pyproject.toml").write_text(merged, encoding=specs.encoding, newline=specs.newline)
+        if args.dry_run:
+            say("  $ (pyproject.toml/uv.lock would now be atomically replaced)", C_DIM)
+            return None
 
-            # uv.lock im Temp-Verzeichnis wurde bisher gegen die BARE uv-init-Datei
-            # aufgeloest (kein [build-system] -> virtual). Die eben gemergte
-            # pyproject.toml hat jetzt wieder [build-system]/etc.
-            # aus dem Original -- ohne Neuauflösung hier würde genau diese veraltete
-            # Lock-Datei gleich unveraendert ins echte Projekt geswapt.
-            run(["uv", "lock"], build_dir, args.dry_run, args.timeout)
+        # ---- 5. Dependencies in die ORIGINALE pyproject.toml einmergen ----
+        built = tomllib.loads((build_dir / "pyproject.toml").read_text(encoding="utf-8"))
+        built_project = built.get("project", {})
+        merged = merge_dependencies(
+            original_text,
+            built_project.get("dependencies", []),
+            built_project.get("optional-dependencies", {}),
+            built.get("dependency-groups", {}),
+            new_requires_python,
+        )
+        (build_dir / "pyproject.toml").write_text(merged, encoding=specs.encoding, newline=specs.newline)
+
+        # uv.lock im Temp-Verzeichnis wurde bisher gegen die BARE uv-init-Datei
+        # aufgeloest (kein [build-system] -> virtual). Die eben gemergte
+        # pyproject.toml hat jetzt wieder [build-system]/etc.
+        # aus dem Original -- ohne Neuauflösung hier würde genau diese veraltete
+        # Lock-Datei gleich unveraendert ins echte Projekt geswapt.
+        run(["uv", "lock"], build_dir, args.dry_run, args.timeout)
 
         # ---- 6. atomarer Tausch -------------------------------------------
         # root blieb bis hierher unveraendert: schlaegt oben etwas fehl
         # (auch per Ctrl+C), gibt es nichts zurueckzuholen.
-        if not args.dry_run:
-            os.replace(build_dir / "pyproject.toml", pyproject)
-            new_lock = build_dir / "uv.lock"
-            if new_lock.is_file():
-                os.replace(new_lock, lock)
-            # only now, against what actually landed -- reporting before the
-            # swap would describe a rebuild that a failing os.replace never made
-            report_changes(original_text, merged)
-        else:
-            say("  $ (pyproject.toml/uv.lock would now be atomically replaced)", C_DIM)
+        os.replace(build_dir / "pyproject.toml", pyproject)
+        new_lock = build_dir / "uv.lock"
+        if new_lock.is_file():
+            os.replace(new_lock, lock)
+
+    return merged
+
+
+def _replaced_since(pyproject: Path, backup: Path) -> bool:
+    """Whether pyproject.toml differs from its copy in 'backup' -- i.e. the
+    swap happened. False if there's no copy yet (the run failed before the
+    backup) or either file can't be read."""
+    saved = backup / "pyproject.toml"
+    try:
+        return saved.is_file() and pyproject.read_bytes() != saved.read_bytes()
+    except OSError:
+        return False
 
 
 def positive_seconds(value: str) -> float:
@@ -1179,14 +1511,20 @@ def positive_seconds(value: str) -> float:
 
     A zero or negative timeout used to be accepted and only surfaced mid-run,
     as 'Command ran longer than -5s and was aborted' -- after the backup had
-    already been written.
+    already been written. The same went for 'inf', 'nan' and anything above
+    ~49 days: float() takes them, but Windows can't wait that long and the
+    first uv call failed with 'cannot convert float infinity to integer'.
     """
     try:
         seconds = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError(f"{value!r} is not a number") from None
+    if math.isnan(seconds):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number")
     if seconds <= 0:
         raise argparse.ArgumentTypeError(f"must be greater than 0, not {value}")
+    if seconds > _MAX_TIMEOUT:
+        raise argparse.ArgumentTypeError(f"must be at most {_MAX_TIMEOUT} (one day), not {value}")
     return seconds
 
 
@@ -1208,7 +1546,7 @@ def main() -> int:
         "--timeout",
         type=positive_seconds,
         default=300.0,
-        help="timeout in seconds per uv call (default: 300)",
+        help=f"timeout in seconds per uv call (default: 300, at most {_MAX_TIMEOUT})",
     )
     p.add_argument(
         "--keep-lock", action="store_true", help="keep uv.lock (uv will then prefer the old versions!)"
@@ -1275,7 +1613,7 @@ def main() -> int:
     # line out of the column entirely
     label_width = max(len(label) for label, _ in rows)
     for label, names in rows:
-        say_row(label, ", ".join(names) or "-", label_width)
+        say_row(label, names or ["-"], label_width)
 
     # ---- Was sich aendert ---------------------------------------------------
     # dependencies/optional-dependencies/dependency-groups werden ersetzt,
@@ -1321,7 +1659,7 @@ def main() -> int:
         say(TEMP_NOTE, C_DIM)
 
     try:
-        build_and_swap(
+        merged = build_and_swap(
             root, pyproject, lock, backup, original_text, specs, args, new_requires_python, pin_python
         )
     except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 -- Notbremse: bei
@@ -1329,9 +1667,22 @@ def main() -> int:
         # geschah in einem Temp-Verzeichnis, root ist daher normalerweise
         # unveraendert; das Backup bleibt als zusaetzliches Netz trotzdem liegen.
         say(f"\n{e}", C_ERR)
-        if not args.dry_run:
+        # the swap is build_and_swap's last step, but a Ctrl+C can still land
+        # between it and the return -- never claim 'unchanged' then
+        if not args.dry_run and _replaced_since(pyproject, backup):
+            say(
+                f"pyproject.toml was already replaced when this happened. The previous one is in {backup}.",
+                C_WARN,
+            )
+        elif not args.dry_run:
             say(f"pyproject.toml unchanged. Backup is at {backup}.", C_WARN)
         return 1
+
+    # ---- Bericht ------------------------------------------------------------
+    # here, not in build_and_swap(): anything going wrong while it prints
+    # (Ctrl+C, a closed pipe) must not read as a failed refresh
+    if merged is not None:
+        report_changes(original_text, merged)
 
     # ---- 7. .python-version ------------------------------------------------
     # (steps 2-6 are build_and_swap's) Only after the atomic swap above: if
@@ -1360,7 +1711,11 @@ def main() -> int:
 
     say("\nDone.", C_OK)
     if args.verbose and pyproject.is_file():
-        say(pyproject.read_text(encoding="utf-8"), C_DIM)
+        # utf-8-sig: a BOM (kept on purpose, see load_project_specs) would
+        # otherwise be printed as U+FEFF -- which crashed the run after it had
+        # succeeded, on any console that can't encode it (Windows cp1252
+        # when redirected: 'uv-refresh -y -v > log.txt')
+        say(pyproject.read_text(encoding="utf-8-sig"), C_DIM)
     return 0
 
 
